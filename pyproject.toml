@@ -1,0 +1,33 @@
+# Tooling-only configuration for PDFEdit.
+#
+# PDFEdit ships as a self-contained PyInstaller bundle, not as a pip-installable
+# package — this file therefore intentionally does not include a [project]
+# table. It only configures developer tooling (pytest, ruff).
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = [
+    "build",
+    "dist",
+    "PDFEdit.iconset",
+    "AUDIT",
+    ".venv",
+    "venv",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+# Line-length is enforced by the formatter, not the linter; keeping E501
+# off here lets long string literals (URLs, error messages) survive.
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
