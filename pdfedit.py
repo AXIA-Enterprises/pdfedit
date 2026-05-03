@@ -27,6 +27,7 @@ from PyQt6.QtGui import (
     QShortcut,
 )
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QAbstractSpinBox,
     QApplication,
     QCheckBox,
@@ -34,6 +35,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDockWidget,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -44,6 +46,7 @@ from PyQt6.QtWidgets import (
     QGraphicsTextItem,
     QGraphicsView,
     QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
@@ -57,10 +60,13 @@ from PyQt6.QtWidgets import (
     QRadioButton,
     QSlider,
     QSpinBox,
+    QStackedWidget,
     QStatusBar,
     QTabWidget,
     QToolBar,
     QToolButton,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -2380,6 +2386,422 @@ class FieldPropertiesDialog(QDialog):
         return align_idx
 
 
+class _FormFieldTree(QTreeWidget):
+    """QTreeWidget subclass that signals its parent panel after an internal-move drop."""
+
+    def __init__(self, panel: "FormBuilderPanel"):
+        super().__init__()
+        self._panel = panel
+
+    def dropEvent(self, ev):
+        super().dropEvent(ev)
+        QTimer.singleShot(0, self._panel.commit_drop)
+
+
+_FIELD_TYPE_LABELS: dict[int, tuple[str, str]] = {
+    fitz.PDF_WIDGET_TYPE_TEXT: ("T", "Text"),
+    fitz.PDF_WIDGET_TYPE_CHECKBOX: ("\u2611", "Checkbox"),
+    fitz.PDF_WIDGET_TYPE_RADIOBUTTON: ("\u25cb", "Radio"),
+    fitz.PDF_WIDGET_TYPE_COMBOBOX: ("\u25bc", "Dropdown"),
+    fitz.PDF_WIDGET_TYPE_LISTBOX: ("\u2630", "List"),
+    fitz.PDF_WIDGET_TYPE_SIGNATURE: ("\u270d", "Signature"),
+    fitz.PDF_WIDGET_TYPE_BUTTON: ("\u25a3", "Button"),
+}
+
+
+def _field_type_display(widget: "fitz.Widget") -> tuple[str, str]:
+    """Return (icon-prefix, type-label) for a widget. Multi-line text gets its
+    own label so the panel surfaces the difference at a glance."""
+    ft = widget.field_type
+    if ft == fitz.PDF_WIDGET_TYPE_TEXT and int(widget.field_flags or 0) & fitz.PDF_TX_FIELD_IS_MULTILINE:
+        return ("\u00b6", "Multi-line")
+    return _FIELD_TYPE_LABELS.get(ft, ("?", "Unknown"))
+
+
+class FormBuilderPanel(QDockWidget):
+    """Adobe-Acrobat-style "Prepare Form" side panel.
+
+    Reads the document via MainWindow.collect_all_widgets() and groups by
+    page in a QTreeWidget. Supports inline rename, drag-reorder (drives the
+    Phase-3 tab-order writeback), Delete/Enter shortcuts, and a context
+    menu mirroring those actions.
+    """
+
+    PAGE_ROLE = Qt.ItemDataRole.UserRole + 1
+    XREF_ROLE = Qt.ItemDataRole.UserRole + 2
+    KIND_ROLE = Qt.ItemDataRole.UserRole + 3  # "page" or "field"
+
+    def __init__(self, window: "MainWindow"):
+        super().__init__("Form Fields", window)
+        self.window_ = window
+        self.setObjectName("FormBuilderPanel")
+        self.setAllowedAreas(
+            Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
+        )
+
+        body = QWidget(self)
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        title = QLabel("Form Fields")
+        f = title.font()
+        f.setBold(True)
+        title.setFont(f)
+        header.addWidget(title)
+        header.addStretch()
+        self.refresh_btn = QToolButton(body)
+        self.refresh_btn.setText("Refresh")
+        self.refresh_btn.setAutoRaise(True)
+        self.refresh_btn.clicked.connect(self.refresh)
+        header.addWidget(self.refresh_btn)
+        layout.addLayout(header)
+
+        self.stack = QStackedWidget(body)
+        layout.addWidget(self.stack, 1)
+
+        self.tree = _FormFieldTree(self)
+        self.tree.setParent(body)
+        self.tree.setColumnCount(2)
+        self.tree.setHeaderLabels(["Field Name", "Type"])
+        self.tree.setUniformRowHeights(True)
+        self.tree.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked)
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.tree.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.tree.setDragEnabled(True)
+        self.tree.setAcceptDrops(True)
+        self.tree.setDropIndicatorShown(True)
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._on_context_menu)
+        self.tree.itemSelectionChanged.connect(self._on_selection_changed)
+        self.tree.itemChanged.connect(self._on_item_changed)
+        self.tree.itemDoubleClicked.connect(self._on_item_double_clicked)
+        try:
+            self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        except Exception:
+            pass
+        self.stack.addWidget(self.tree)
+
+        self.empty_label = QLabel(
+            "No form fields yet — pick a tool from the Forms menu and drag on the page to create one."
+        )
+        self.empty_label.setWordWrap(True)
+        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.empty_label.setContentsMargins(8, 8, 8, 8)
+        self.stack.addWidget(self.empty_label)
+
+        self.status_label = QLabel("0 fields")
+        sf = self.status_label.font()
+        sf.setPointSize(max(8, sf.pointSize() - 1))
+        self.status_label.setFont(sf)
+        layout.addWidget(self.status_label)
+
+        self.setWidget(body)
+
+        self._suspend_changes = False
+        self._dropped = False
+        self.tree.installEventFilter(self)
+        self.refresh()
+
+    # --- public API used by tests ---
+    def refresh(self) -> None:
+        self._suspend_changes = True
+        try:
+            self.tree.clear()
+            pairs = self.window_.collect_all_widgets() if self.window_.view.doc else []
+            by_page: dict[int, list["fitz.Widget"]] = {}
+            for pi, w in pairs:
+                by_page.setdefault(pi, []).append(w)
+
+            total = len(pairs)
+            if total == 0:
+                self.stack.setCurrentWidget(self.empty_label)
+                self.status_label.setText("0 fields")
+                return
+            self.stack.setCurrentWidget(self.tree)
+
+            for pi in sorted(by_page.keys()):
+                page_item = QTreeWidgetItem([f"Page {pi + 1}", ""])
+                page_item.setData(0, self.KIND_ROLE, "page")
+                page_item.setData(0, self.PAGE_ROLE, pi)
+                page_item.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsDropEnabled
+                )
+                page_font = page_item.font(0)
+                page_font.setBold(True)
+                page_item.setFont(0, page_font)
+                self.tree.addTopLevelItem(page_item)
+                page_item.setFirstColumnSpanned(True)
+                page_item.setExpanded(True)
+                for w in by_page[pi]:
+                    self._append_field_item(page_item, pi, w)
+
+            self.status_label.setText(f"{total} field{'s' if total != 1 else ''}")
+        finally:
+            self._suspend_changes = False
+
+    def _append_field_item(self, parent: QTreeWidgetItem, pi: int, w: "fitz.Widget") -> None:
+        icon, type_label = _field_type_display(w)
+        name = w.field_name or "(unnamed)"
+        item = QTreeWidgetItem([f"{icon}  {name}", type_label])
+        item.setData(0, self.KIND_ROLE, "field")
+        item.setData(0, self.PAGE_ROLE, pi)
+        item.setData(0, self.XREF_ROLE, w.xref)
+        item.setData(0, Qt.ItemDataRole.UserRole, name)
+        flags = (
+            Qt.ItemFlag.ItemIsEnabled
+            | Qt.ItemFlag.ItemIsSelectable
+            | Qt.ItemFlag.ItemIsEditable
+            | Qt.ItemFlag.ItemIsDragEnabled
+        )
+        item.setFlags(flags)
+        if int(w.field_flags or 0) & 2:
+            f = item.font(0)
+            f.setBold(True)
+            item.setFont(0, f)
+            item.setFont(1, f)
+        parent.addChild(item)
+
+    def selected_widget(self) -> "tuple[int, fitz.Widget] | None":
+        items = self.tree.selectedItems()
+        if not items:
+            return None
+        item = items[0]
+        if item.data(0, self.KIND_ROLE) != "field":
+            return None
+        return self._resolve_widget(item)
+
+    def _resolve_widget(self, item: QTreeWidgetItem) -> "tuple[int, fitz.Widget] | None":
+        pi = item.data(0, self.PAGE_ROLE)
+        xr = item.data(0, self.XREF_ROLE)
+        if pi is None or xr is None or not self.window_.view.doc:
+            return None
+        if pi < 0 or pi >= len(self.window_.view.doc):
+            return None
+        try:
+            page = self.window_.view.doc[pi]
+        except Exception:
+            return None
+        for w in page.widgets():
+            if w.xref == xr:
+                # Stash the page so the annot binding survives the lifetime of
+                # the caller — fitz.Widget without a live page raises 'annotation
+                # not bound to any page' on update()/delete_widget().
+                self._page_pin = page
+                return (pi, w)
+        return None
+
+    def select_widget_by_xref(self, page_idx: int, xref: int) -> None:
+        for i in range(self.tree.topLevelItemCount()):
+            top = self.tree.topLevelItem(i)
+            for j in range(top.childCount()):
+                child = top.child(j)
+                if (
+                    child.data(0, self.PAGE_ROLE) == page_idx
+                    and child.data(0, self.XREF_ROLE) == xref
+                ):
+                    self.tree.setCurrentItem(child)
+                    return
+
+    def delete_selected(self) -> bool:
+        sel = self.selected_widget()
+        if sel is None:
+            return False
+        pi, w = sel
+        try:
+            self.window_.delete_widget(pi, w)
+        finally:
+            self._page_pin = None
+        return True
+
+    def open_properties_for_selected(self) -> bool:
+        sel = self.selected_widget()
+        if sel is None:
+            return False
+        pi, w = sel
+        self.window_.edit_widget_properties(pi, w)
+        return True
+
+    def rename_item(self, item: QTreeWidgetItem, new_name: str) -> bool:
+        """Programmatic rename hook for tests. Mirrors the inline-edit path."""
+        if item is None or item.data(0, self.KIND_ROLE) != "field":
+            return False
+        new_name = (new_name or "").strip()
+        if not new_name:
+            return False
+        sel = self._resolve_widget(item)
+        if sel is None:
+            return False
+        pi, w = sel
+        # Skip if unchanged
+        if w.field_name == new_name:
+            return True
+        page = self.window_.view.doc[pi]  # keep page binding alive
+        self.window_._snapshot()
+        try:
+            w.field_name = new_name
+            w.update()
+        except Exception:
+            if self.window_._undo:
+                self.window_._undo.pop()
+            return False
+        # Refresh to repaint badges/icons (and the page view).
+        self.window_.view.render_all(preserve_scroll=True)
+        self.window_._mark_dirty()
+        self.window_._refresh_form_panel()
+        del page
+        return True
+
+    def apply_reorder(self, ordered_xrefs: list[tuple[int, int]]) -> None:
+        """Persist a new tab order, mirroring TabOrderDialog.apply_to_doc()."""
+        doc = self.window_.view.doc
+        if doc is None:
+            return
+        per_page: dict[int, list[int]] = {}
+        for pi, xr in ordered_xrefs:
+            per_page.setdefault(pi, []).append(xr)
+        self.window_._snapshot()
+        try:
+            for pi, widget_xrefs in per_page.items():
+                if pi < 0 or pi >= len(doc):
+                    continue
+                page = doc[pi]
+                current_widget_xrefs = {w.xref for w in page.widgets()}
+                try:
+                    _, raw = doc.xref_get_key(page.xref, "Annots")
+                except Exception:
+                    raw = ""
+                existing_order: list[int] = []
+                for m in re.findall(r"(\d+)\s+0\s+R", raw or ""):
+                    existing_order.append(int(m))
+                non_widget_tail = [
+                    x for x in existing_order if x not in current_widget_xrefs
+                ]
+                new_order = list(widget_xrefs) + non_widget_tail
+                arr = "[ " + " ".join(f"{x} 0 R" for x in new_order) + " ]"
+                doc.xref_set_key(page.xref, "Annots", arr)
+                doc.xref_set_key(page.xref, "Tabs", "/R")
+        except Exception as exc:
+            QMessageBox.warning(self, "Reorder", f"Could not reorder: {exc}")
+            if self.window_._undo:
+                self.window_._undo.pop()
+            return
+        self.window_.view.render_all(preserve_scroll=True)
+        self.window_._mark_dirty()
+        self.window_._refresh_form_panel()
+
+    def current_order(self) -> list[tuple[int, int]]:
+        out: list[tuple[int, int]] = []
+        for i in range(self.tree.topLevelItemCount()):
+            top = self.tree.topLevelItem(i)
+            pi = top.data(0, self.PAGE_ROLE)
+            for j in range(top.childCount()):
+                child = top.child(j)
+                xr = child.data(0, self.XREF_ROLE)
+                if xr is not None:
+                    out.append((int(pi if pi is not None else child.data(0, self.PAGE_ROLE)), int(xr)))
+        return out
+
+    # --- event handlers ---
+    def _on_selection_changed(self) -> None:
+        sel = self.selected_widget()
+        if sel is None:
+            return
+        pi, w = sel
+        self.window_.focus_widget_in_view(pi, w)
+
+    def _on_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
+        if self._suspend_changes or column != 0:
+            return
+        if item.data(0, self.KIND_ROLE) != "field":
+            return
+        new_text = item.text(0).strip()
+        # Strip the icon prefix the user may not have removed.
+        prefix_chars = {label[0] for label in _FIELD_TYPE_LABELS.values()}
+        prefix_chars.add("\u00b6")
+        cleaned = new_text
+        for prefix in list(prefix_chars):
+            if cleaned.startswith(prefix):
+                cleaned = cleaned[len(prefix):].lstrip()
+                break
+        prev = item.data(0, Qt.ItemDataRole.UserRole) or ""
+        if not cleaned or cleaned == prev:
+            self._suspend_changes = True
+            try:
+                icon, _ = "", ""
+                sel = self._resolve_widget(item)
+                if sel is not None:
+                    _, w = sel
+                    icon, _ = _field_type_display(w)
+                item.setText(0, f"{icon}  {prev}")
+            finally:
+                self._suspend_changes = False
+            return
+        ok = self.rename_item(item, cleaned)
+        if not ok:
+            self._suspend_changes = True
+            try:
+                sel = self._resolve_widget(item)
+                if sel is not None:
+                    _, w = sel
+                    icon, _ = _field_type_display(w)
+                else:
+                    icon = ""
+                item.setText(0, f"{icon}  {prev}")
+            finally:
+                self._suspend_changes = False
+
+    def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int) -> None:
+        # Double-click on the type column or a page row: open properties.
+        if item.data(0, self.KIND_ROLE) != "field":
+            return
+        if column == 1:
+            self.open_properties_for_selected()
+
+    def _on_context_menu(self, pos) -> None:
+        item = self.tree.itemAt(pos)
+        if item is None:
+            return
+        self.tree.setCurrentItem(item)
+        if item.data(0, self.KIND_ROLE) != "field":
+            return
+        menu = QMenu(self.tree)
+        act_props = menu.addAction("Properties…")
+        act_rename = menu.addAction("Rename")
+        menu.addSeparator()
+        act_del = menu.addAction("Delete")
+        chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
+        if chosen is act_props:
+            self.open_properties_for_selected()
+        elif chosen is act_rename:
+            self.tree.editItem(item, 0)
+        elif chosen is act_del:
+            self.delete_selected()
+
+    def eventFilter(self, obj, ev):
+        if obj is self.tree and ev.type() == QEvent.Type.KeyPress:
+            key = ev.key()
+            if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+                if self.delete_selected():
+                    return True
+            elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                if self.open_properties_for_selected():
+                    return True
+        return super().eventFilter(obj, ev)
+
+    def dropEvent(self, ev):  # pragma: no cover - dock itself isn't drop target
+        super().dropEvent(ev)
+
+    # Hook drop on the inner tree to commit a reorder.
+    # We override via a wrapper installed on the tree.
+    def commit_drop(self) -> None:
+        ordered = self.current_order()
+        self.apply_reorder(ordered)
+
+
 class TabOrderDialog(QDialog):
     """Reorder form-field tab order document-wide.
 
@@ -2535,6 +2957,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.view)
         self.setStatusBar(QStatusBar())
         self._build_toolbar()
+        self._build_form_panel()
         self.statusBar().showMessage("Open a PDF to begin (⌘O) — or drop one onto the window")
 
     # --- Title / dirty tracking ---
@@ -2593,6 +3016,7 @@ class MainWindow(QMainWindow):
         self.view.render_all(preserve_scroll=True)
         self._refresh_page_label()
         self.refresh_format_toolbar()
+        self._refresh_form_panel()
 
     def undo(self):
         if not self._undo or not self.view.doc:
@@ -3206,6 +3630,7 @@ class MainWindow(QMainWindow):
         self.dirty = True
         self._refresh_title()
         self._refresh_page_label()
+        self._refresh_form_panel()
         self.statusBar().showMessage(
             f"Created new {count}-page PDF ({width_pt/72:.2f} × {height_pt/72:.2f} in)"
         )
@@ -3232,6 +3657,7 @@ class MainWindow(QMainWindow):
         self._mark_clean()
         self._refresh_page_label()
         self._add_recent(path)
+        self._refresh_form_panel()
         self.statusBar().showMessage(f"Opened {path}")
 
     # --- Recent files ---
@@ -3799,6 +4225,7 @@ class MainWindow(QMainWindow):
         page.add_widget(w)
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
+        self._refresh_form_panel()
 
     def do_form_check(self, page_idx: int, x0, y0, x1, y1):
         if x1 - x0 < 5 or y1 - y0 < 5:
@@ -3819,6 +4246,7 @@ class MainWindow(QMainWindow):
         page.add_widget(w)
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
+        self._refresh_form_panel()
 
     def do_form_multiline(self, page_idx: int, x0, y0, x1, y1):
         if x1 - x0 < 5 or y1 - y0 < 5:
@@ -3840,6 +4268,7 @@ class MainWindow(QMainWindow):
         page.add_widget(w)
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
+        self._refresh_form_panel()
 
     def do_form_radio(self, page_idx: int, x0, y0, x1, y1):
         if x1 - x0 < 5 or y1 - y0 < 5:
@@ -3895,6 +4324,7 @@ class MainWindow(QMainWindow):
             print(f"[radio] group link failed: {exc}", file=sys.stderr)
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
+        self._refresh_form_panel()
 
     def _prompt_choices(self, title: str):
         name, ok = QInputDialog.getText(self, title, "Field name:")
@@ -3928,6 +4358,7 @@ class MainWindow(QMainWindow):
         page.add_widget(w)
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
+        self._refresh_form_panel()
 
     def do_form_list(self, page_idx: int, x0, y0, x1, y1):
         if x1 - x0 < 5 or y1 - y0 < 5:
@@ -3949,6 +4380,7 @@ class MainWindow(QMainWindow):
         page.add_widget(w)
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
+        self._refresh_form_panel()
 
     def do_form_signature(self, page_idx: int, x0, y0, x1, y1):
         if x1 - x0 < 5 or y1 - y0 < 5:
@@ -3967,6 +4399,7 @@ class MainWindow(QMainWindow):
         page.add_widget(w)
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
+        self._refresh_form_panel()
 
     def do_form_date(self, page_idx: int, x0, y0, x1, y1):
         if x1 - x0 < 5 or y1 - y0 < 5:
@@ -3988,6 +4421,7 @@ class MainWindow(QMainWindow):
         page.add_widget(w)
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
+        self._refresh_form_panel()
 
     def do_form_button(self, page_idx: int, x0, y0, x1, y1):
         if x1 - x0 < 5 or y1 - y0 < 5:
@@ -4011,6 +4445,7 @@ class MainWindow(QMainWindow):
         page.add_widget(w)
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
+        self._refresh_form_panel()
 
     # --- Form field editing (Phase 2) ---
     def _widget_at(self, page_idx: int, pdf_x: float, pdf_y: float):
@@ -4066,6 +4501,7 @@ class MainWindow(QMainWindow):
             return
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
+        self._refresh_form_panel()
 
     def collect_all_widgets(self):
         """Document-wide tab-order source: list of (page_idx, widget) tuples
@@ -4099,6 +4535,7 @@ class MainWindow(QMainWindow):
             return
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
+        self._refresh_form_panel()
 
     def delete_widget(self, page_idx: int, widget):
         """Remove `widget` from page `page_idx` (with snapshot + render)."""
@@ -4117,6 +4554,121 @@ class MainWindow(QMainWindow):
             return
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
+        self._refresh_form_panel()
+
+    # --- Form Builder side panel (Phase 4) ---
+    def _build_form_panel(self):
+        self.form_panel = FormBuilderPanel(self)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.form_panel)
+
+        self.act_show_form_panel = self.form_panel.toggleViewAction()
+        self.act_show_form_panel.setText("Show Form Fields Panel")
+
+        # Insert into the existing &Forms native menu and the in-app duplicate.
+        for mb in (self.menuBar(), self.in_app_menubar):
+            menus = []
+            if isinstance(mb, QToolBar):
+                for act in mb.actions():
+                    btn = mb.widgetForAction(act)
+                    if isinstance(btn, QToolButton) and btn.menu() is not None and btn.text() == "Forms":
+                        menus.append(btn.menu())
+            else:
+                for act in mb.actions():
+                    if act.menu() is not None and (act.text() == "&Forms" or act.text() == "Forms"):
+                        menus.append(act.menu())
+            for menu in menus:
+                menu.addSeparator()
+                menu.addAction(self.act_show_form_panel)
+
+        # Restore visibility from QSettings (default: hidden until a doc with widgets loads).
+        self._form_panel_user_choice: bool | None = self._read_form_panel_visibility()
+        if self._form_panel_user_choice is None:
+            self.form_panel.setVisible(False)
+        else:
+            self.form_panel.setVisible(self._form_panel_user_choice)
+        self.form_panel.visibilityChanged.connect(self._on_form_panel_visibility_changed)
+
+    def _read_form_panel_visibility(self) -> bool | None:
+        try:
+            s = QSettings()
+            v = s.value("formBuilderPanelVisible")
+        except Exception:
+            return None
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            return v.lower() in ("true", "1", "yes")
+        try:
+            return bool(int(v))
+        except Exception:
+            return bool(v)
+
+    def _on_form_panel_visibility_changed(self, visible: bool) -> None:
+        self._form_panel_user_choice = visible
+        try:
+            QSettings().setValue("formBuilderPanelVisible", visible)
+        except Exception:
+            pass
+
+    def _refresh_form_panel(self) -> None:
+        panel = getattr(self, "form_panel", None)
+        if panel is None:
+            return
+        QTimer.singleShot(0, panel.refresh)
+        # Also refresh synchronously so tests that don't spin the event loop see the new state.
+        panel.refresh()
+        # Auto-show on first widget if user hasn't explicitly hidden it.
+        if self._form_panel_user_choice is None and self.view.doc:
+            has_any = any(True for _ in self.collect_all_widgets())
+            if has_any and not panel.isVisible():
+                panel.blockSignals(True)
+                panel.setVisible(True)
+                panel.blockSignals(False)
+
+    def focus_widget_in_view(self, page_idx: int, widget) -> None:
+        """Scroll the view to a widget and draw a transient highlight ring."""
+        if not self.view.doc or widget is None:
+            return
+        if page_idx < 0 or page_idx >= len(self.view.doc):
+            return
+        if self.view.mode != "select":
+            self._activate_tool("select")
+        try:
+            scene_rect = self.view._pdf_rect_to_scene(page_idx, widget.rect)
+        except Exception:
+            return
+        self.view.centerOn(scene_rect.center())
+        self.view.page_idx = page_idx
+        self._refresh_page_label()
+        self._show_widget_highlight(scene_rect)
+
+    def _show_widget_highlight(self, scene_rect) -> None:
+        item = getattr(self, "_widget_highlight_item", None)
+        if item is None or item.scene() is not self.view.scene_:
+            item = QGraphicsRectItem()
+            pen = QPen(QColor(30, 120, 255, 220))
+            pen.setWidth(3)
+            item.setPen(pen)
+            item.setBrush(QBrush(QColor(30, 120, 255, 40)))
+            item.setZValue(10000)
+            self.view.scene_.addItem(item)
+            self._widget_highlight_item = item
+        item.setRect(scene_rect)
+        item.setVisible(True)
+        timer = getattr(self, "_widget_highlight_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._hide_widget_highlight)
+            self._widget_highlight_timer = timer
+        timer.start(1500)
+
+    def _hide_widget_highlight(self) -> None:
+        item = getattr(self, "_widget_highlight_item", None)
+        if item is not None:
+            item.setVisible(False)
 
     # --- Page management ---
     def rotate_current_page(self):
