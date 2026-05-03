@@ -4,6 +4,10 @@ These exercise FieldPropertiesDialog without going through .exec() — we
 instantiate it, drive its sub-widgets directly, then call
 `_apply_to_widget()` (which is split out from accept() exactly so tests
 can poke it). Then we save+reopen the PDF and confirm the change baked.
+
+Phase 5: do_form_* no longer prompts for a field name (auto-generated).
+Tests that need a specific name set it via rename_last_widget() after
+creation, OR drive it through the dialog's name_edit field.
 """
 
 from __future__ import annotations
@@ -12,7 +16,7 @@ import fitz
 import pytest
 from PyQt6.QtGui import QColor
 
-from conftest import install_doc, make_blank_doc
+from conftest import install_doc, make_blank_doc, rename_last_widget
 
 import pdfedit
 
@@ -48,10 +52,9 @@ def _first_widget(win):
     return page, list(page.widgets())[0]
 
 
-def test_text_field_name_and_tooltip_round_trip(main_window, tmp_path, monkeypatch):
+def test_text_field_name_and_tooltip_round_trip(main_window, tmp_path):
     win = main_window
     install_doc(win, make_blank_doc())
-    _patch_text(monkeypatch, "orig_name")
     win.do_form_text(0, 50, 50, 250, 80)
 
     page, w = _first_widget(win)
@@ -68,11 +71,11 @@ def test_text_field_name_and_tooltip_round_trip(main_window, tmp_path, monkeypat
     assert ww.field_label == "Enter your full name"
 
 
-def test_checkbox_default_state_round_trip(main_window, tmp_path, monkeypatch):
+def test_checkbox_default_state_round_trip(main_window, tmp_path):
     win = main_window
     install_doc(win, make_blank_doc())
-    _patch_text(monkeypatch, "agree")
     win.do_form_check(0, 50, 50, 80, 80)
+    rename_last_widget(win, 0, "agree")
 
     page, w = _first_widget(win)
     dlg = pdfedit.FieldPropertiesDialog(w, parent=None)
@@ -89,11 +92,11 @@ def test_checkbox_default_state_round_trip(main_window, tmp_path, monkeypatch):
     assert ww.field_value not in (False, "Off", "off", None, "", 0)
 
 
-def test_combobox_choices_round_trip(main_window, tmp_path, monkeypatch):
+def test_combobox_choices_round_trip(main_window, tmp_path):
     win = main_window
     install_doc(win, make_blank_doc())
-    _patch_text(monkeypatch, "country", "X")  # X is a placeholder; we'll overwrite
     win.do_form_combo(0, 50, 50, 250, 80)
+    rename_last_widget(win, 0, "country")
 
     page, w = _first_widget(win)
     dlg = pdfedit.FieldPropertiesDialog(w, parent=None)
@@ -114,11 +117,11 @@ def test_combobox_choices_round_trip(main_window, tmp_path, monkeypatch):
     assert flat == ["a", "b", "c"]
 
 
-def test_required_flag_round_trip(main_window, tmp_path, monkeypatch):
+def test_required_flag_round_trip(main_window, tmp_path):
     win = main_window
     install_doc(win, make_blank_doc())
-    _patch_text(monkeypatch, "required_field")
     win.do_form_text(0, 50, 50, 250, 80)
+    rename_last_widget(win, 0, "required_field")
 
     page, w = _first_widget(win)
     dlg = pdfedit.FieldPropertiesDialog(w, parent=None)
@@ -132,11 +135,11 @@ def test_required_flag_round_trip(main_window, tmp_path, monkeypatch):
     assert ww.field_flags & 2, f"expected REQUIRED bit set, got {ww.field_flags}"
 
 
-def test_border_color_round_trip(main_window, tmp_path, monkeypatch):
+def test_border_color_round_trip(main_window, tmp_path):
     win = main_window
     install_doc(win, make_blank_doc())
-    _patch_text(monkeypatch, "colored")
     win.do_form_text(0, 50, 50, 250, 80)
+    rename_last_widget(win, 0, "colored")
 
     page, w = _first_widget(win)
     dlg = pdfedit.FieldPropertiesDialog(w, parent=None)
@@ -153,12 +156,13 @@ def test_border_color_round_trip(main_window, tmp_path, monkeypatch):
     assert bc[0] > 0.95 and bc[1] < 0.05 and bc[2] < 0.05, f"got {bc}"
 
 
-def test_delete_widget_removes_one_of_two(main_window, tmp_path, monkeypatch):
+def test_delete_widget_removes_one_of_two(main_window, tmp_path):
     win = main_window
     install_doc(win, make_blank_doc())
-    _patch_text(monkeypatch, "field_a", "field_b")
     win.do_form_text(0, 50, 50, 250, 80)
+    rename_last_widget(win, 0, "field_a")
     win.do_form_text(0, 50, 100, 250, 130)
+    rename_last_widget(win, 0, "field_b")
 
     page = win.view.doc[0]
     widgets = list(page.widgets())
@@ -171,11 +175,11 @@ def test_delete_widget_removes_one_of_two(main_window, tmp_path, monkeypatch):
     assert names == ["field_b"], f"expected only field_b, got {names}"
 
 
-def test_widget_at_hit_test(main_window, monkeypatch):
+def test_widget_at_hit_test(main_window):
     win = main_window
     install_doc(win, make_blank_doc())
-    _patch_text(monkeypatch, "hit_me")
     win.do_form_text(0, 100, 100, 300, 140)
+    rename_last_widget(win, 0, "hit_me")
 
     # Inside the rect → finds the widget.
     found = win._widget_at(0, 200, 120)

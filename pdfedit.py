@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import sys
@@ -1754,6 +1755,47 @@ def _collect_text_field_names(doc: "fitz.Document") -> list[str]:
     return sorted(seen)
 
 
+def _all_field_names(doc: "fitz.Document") -> set[str]:
+    out: set[str] = set()
+    if doc is None:
+        return out
+    for i in range(len(doc)):
+        try:
+            page = doc[i]
+        except Exception:
+            continue
+        for w in page.widgets():
+            if w.field_name:
+                out.add(w.field_name)
+    return out
+
+
+def _unique_field_name(doc: "fitz.Document", base: str) -> str:
+    """Return f'{base}_{n}' for the lowest n>=1 not already used as a field name."""
+    used = _all_field_names(doc)
+    n = 1
+    while f"{base}_{n}" in used:
+        n += 1
+    return f"{base}_{n}"
+
+
+@contextlib.contextmanager
+def _bound_widget(doc, page_idx, xref):
+    """Yield (page, widget) with the page guaranteed live for the block.
+
+    fitz.Widget instances obtained from page.widgets() raise
+    'annotation not bound to any page' once the originating page reference
+    is GC'd. Callers that mutate a widget across function boundaries must
+    use this helper so the page binding survives the mutation.
+    """
+    page = doc[page_idx]
+    for w in page.widgets():
+        if w.xref == xref:
+            yield page, w
+            return
+    raise KeyError(f"widget xref {xref} not on page {page_idx}")
+
+
 def _set_radio_on_state(doc: "fitz.Document", widget_xref: int, on_state: str) -> None:
     """Rename the /AP/N on-state key for a radio. PyMuPDF ignores
     button_caption when adding radio widgets — both kids get /Yes by default,
@@ -2575,6 +2617,12 @@ class FormBuilderPanel(QDockWidget):
         return self._resolve_widget(item)
 
     def _resolve_widget(self, item: QTreeWidgetItem) -> "tuple[int, fitz.Widget] | None":
+        """Return (page_idx, widget) for a tree item, or None if not found.
+
+        Callers that mutate the widget across function boundaries should
+        re-resolve via _bound_widget — the widget yielded here is only safe
+        to read inside the immediate caller frame.
+        """
         pi = item.data(0, self.PAGE_ROLE)
         xr = item.data(0, self.XREF_ROLE)
         if pi is None or xr is None or not self.window_.view.doc:
@@ -2587,10 +2635,6 @@ class FormBuilderPanel(QDockWidget):
             return None
         for w in page.widgets():
             if w.xref == xr:
-                # Stash the page so the annot binding survives the lifetime of
-                # the caller — fitz.Widget without a live page raises 'annotation
-                # not bound to any page' on update()/delete_widget().
-                self._page_pin = page
                 return (pi, w)
         return None
 
@@ -2611,10 +2655,9 @@ class FormBuilderPanel(QDockWidget):
         if sel is None:
             return False
         pi, w = sel
-        try:
-            self.window_.delete_widget(pi, w)
-        finally:
-            self._page_pin = None
+        # delete_widget re-resolves under _bound_widget, so the page binding
+        # is held inside that call — no _page_pin workaround needed.
+        self.window_.delete_widget(pi, w)
         return True
 
     def open_properties_for_selected(self) -> bool:
@@ -2632,27 +2675,26 @@ class FormBuilderPanel(QDockWidget):
         new_name = (new_name or "").strip()
         if not new_name:
             return False
-        sel = self._resolve_widget(item)
-        if sel is None:
+        pi = item.data(0, self.PAGE_ROLE)
+        xr = item.data(0, self.XREF_ROLE)
+        if pi is None or xr is None or not self.window_.view.doc:
             return False
-        pi, w = sel
-        # Skip if unchanged
-        if w.field_name == new_name:
-            return True
-        page = self.window_.view.doc[pi]  # keep page binding alive
         self.window_._snapshot()
         try:
-            w.field_name = new_name
-            w.update()
+            with _bound_widget(self.window_.view.doc, pi, xr) as (_page, w):
+                if w.field_name == new_name:
+                    if self.window_._undo:
+                        self.window_._undo.pop()
+                    return True
+                w.field_name = new_name
+                w.update()
         except Exception:
             if self.window_._undo:
                 self.window_._undo.pop()
             return False
-        # Refresh to repaint badges/icons (and the page view).
         self.window_.view.render_all(preserve_scroll=True)
         self.window_._mark_dirty()
         self.window_._refresh_form_panel()
-        del page
         return True
 
     def apply_reorder(self, ordered_xrefs: list[tuple[int, int]]) -> None:
@@ -3061,6 +3103,8 @@ class MainWindow(QMainWindow):
 
         # Forms (one-shot)
         self.act_tab_order = make("Tab Order…", self.open_tab_order_dialog)
+        self.act_reset_form = make("Reset Form", self.reset_form)
+        self.act_flatten_form = make("Flatten Form", self.flatten_form)
 
         # Open Recent submenu — populated dynamically from QSettings on aboutToShow.
         self.recent_menu = QMenu("Open Recent", self)
@@ -3103,15 +3147,15 @@ class MainWindow(QMainWindow):
             "sticky": "Click to add a sticky note. (N)",
             "erase": "Drag a rectangle to white out (redact) content. (E)",
             "image": "Click on the page to insert an image file. (I)",
-            "form-text": "Drag to add a fillable text field.",
-            "form-multiline": "Drag to add a multi-line text field.",
-            "form-check": "Drag to add a checkbox.",
-            "form-radio": "Drag to add a radio button (group siblings by name). (R)",
-            "form-combo": "Drag to add a dropdown. (D)",
-            "form-list": "Drag to add a list box.",
-            "form-signature": "Drag to add a signature field for the recipient.",
-            "form-date": "Drag to add a date field.",
-            "form-button": "Drag to add a push button. (B)",
+            "form-text": "Drag to add a single-line fillable text field. Properties dialog opens for tooltip, default value, format.",
+            "form-multiline": "Drag to add a multi-line text area for paragraphs of input.",
+            "form-check": "Drag to add a checkbox the user can toggle on/off.",
+            "form-radio": "Drag to add a radio button — siblings sharing a group name are mutually exclusive. (R)",
+            "form-combo": "Drag to add a dropdown menu (one selection from a list of choices). (D)",
+            "form-list": "Drag to add a scrollable list box (one or more selections).",
+            "form-signature": "Drag to add a signature field where the recipient will sign.",
+            "form-date": "Drag to add a date field with a YYYY-MM-DD format hint.",
+            "form-button": "Drag to add a push button (link to an action or script). (B)",
         }
         # Single-key shortcuts. We gate them at the QShortcut level (see
         # _install_tool_shortcuts) so they don't fire while typing into a
@@ -3182,7 +3226,8 @@ class MainWindow(QMainWindow):
                        self.act_zoom_in, self.act_zoom_out, self.act_zoom_reset]),
             ("&Insert", [*_insert_actions, None, self.act_page_numbers]),
             ("&Pages", [self.act_insert_blank, self.act_rotate, self.act_delete_page]),
-            ("&Forms", [*self._form_actions, None, self.act_tab_order]),
+            ("&Forms", [*self._form_actions, None, self.act_tab_order,
+                        None, self.act_reset_form, self.act_flatten_form]),
             ("&Tools", [self.act_watermark]),
         ]
 
@@ -4206,16 +4251,32 @@ class MainWindow(QMainWindow):
         self._mark_dirty()
         self.statusBar().showMessage(f"Inserted {os.path.basename(path)}")
 
+    def _post_create_field(self, page_idx: int, w: "fitz.Widget") -> None:
+        """Common tail for do_form_*: render, mark dirty, refresh panel,
+        then auto-open the Properties dialog. Cancel keeps the field as-is —
+        the user dragged it intentionally.
+
+        The original `w` returned from page.add_widget() has xref=0 (the
+        widget object isn't rebound to the new annot xref). Refetch from
+        page.widgets() so edit_widget_properties can locate it.
+        """
+        self.view.render_all(preserve_scroll=True)
+        self._mark_dirty()
+        self._refresh_form_panel()
+        try:
+            page = self.view.doc[page_idx]
+            real = list(page.widgets())[-1]
+        except Exception:
+            return
+        self.edit_widget_properties(page_idx, real)
+
     def do_form_text(self, page_idx: int, x0, y0, x1, y1):
         if x1 - x0 < 5 or y1 - y0 < 5:
-            return
-        name, ok = QInputDialog.getText(self, "Text Field", "Field name:")
-        if not ok or not name.strip():
             return
         self._snapshot()
         page = self.view.doc[page_idx]
         w = fitz.Widget()
-        w.field_name = name.strip()
+        w.field_name = _unique_field_name(self.view.doc, "Text")
         w.field_type = fitz.PDF_WIDGET_TYPE_TEXT
         w.rect = fitz.Rect(x0, y0, x1, y1)
         w.field_value = ""
@@ -4223,41 +4284,31 @@ class MainWindow(QMainWindow):
         w.border_color = (0.4, 0.4, 0.4)
         w.fill_color = (1, 1, 1)
         page.add_widget(w)
-        self.view.render_all(preserve_scroll=True)
-        self._mark_dirty()
-        self._refresh_form_panel()
+        self._post_create_field(page_idx, w)
 
     def do_form_check(self, page_idx: int, x0, y0, x1, y1):
         if x1 - x0 < 5 or y1 - y0 < 5:
             return
         side = min(x1 - x0, y1 - y0)
         x1, y1 = x0 + side, y0 + side
-        name, ok = QInputDialog.getText(self, "Checkbox", "Field name:")
-        if not ok or not name.strip():
-            return
         self._snapshot()
         page = self.view.doc[page_idx]
         w = fitz.Widget()
-        w.field_name = name.strip()
+        w.field_name = _unique_field_name(self.view.doc, "Checkbox")
         w.field_type = fitz.PDF_WIDGET_TYPE_CHECKBOX
         w.rect = fitz.Rect(x0, y0, x1, y1)
         w.field_value = False
         w.border_color = (0.4, 0.4, 0.4)
         page.add_widget(w)
-        self.view.render_all(preserve_scroll=True)
-        self._mark_dirty()
-        self._refresh_form_panel()
+        self._post_create_field(page_idx, w)
 
     def do_form_multiline(self, page_idx: int, x0, y0, x1, y1):
         if x1 - x0 < 5 or y1 - y0 < 5:
             return
-        name, ok = QInputDialog.getText(self, "Multi-line Text", "Field name:")
-        if not ok or not name.strip():
-            return
         self._snapshot()
         page = self.view.doc[page_idx]
         w = fitz.Widget()
-        w.field_name = name.strip()
+        w.field_name = _unique_field_name(self.view.doc, "Multiline")
         w.field_type = fitz.PDF_WIDGET_TYPE_TEXT
         w.field_flags = fitz.PDF_TX_FIELD_IS_MULTILINE
         w.rect = fitz.Rect(x0, y0, x1, y1)
@@ -4266,39 +4317,27 @@ class MainWindow(QMainWindow):
         w.border_color = (0.4, 0.4, 0.4)
         w.fill_color = (1, 1, 1)
         page.add_widget(w)
-        self.view.render_all(preserve_scroll=True)
-        self._mark_dirty()
-        self._refresh_form_panel()
+        self._post_create_field(page_idx, w)
 
     def do_form_radio(self, page_idx: int, x0, y0, x1, y1):
         if x1 - x0 < 5 or y1 - y0 < 5:
             return
         side = min(x1 - x0, y1 - y0)
         x1, y1 = x0 + side, y0 + side
+        # Group name is the one prompt we keep — radios MUST share a group
+        # name to be mutually exclusive, and there's no good default.
         group, ok = QInputDialog.getText(
             self, "Radio Button", "Group name (siblings sharing this name are mutually exclusive):"
         )
         if not ok or not group.strip():
             return
         group = group.strip()
-        # Phase 3: enforce unique export-value within an existing group so the
-        # /Parent/Kids linkage gives mutually exclusive on-states.
+        # Auto-pick a unique export value within this group.
         existing_caps = set(_radio_export_values(self.view.doc, group))
-        while True:
-            export, ok = QInputDialog.getText(
-                self, "Radio Button", "Export value (the on-state for this button):"
-            )
-            if not ok or not export.strip():
-                return
-            export = export.strip()
-            if export in existing_caps:
-                QMessageBox.warning(
-                    self,
-                    "Radio Button",
-                    f"'{export}' is already used in group '{group}'. Pick another value.",
-                )
-                continue
-            break
+        n = 1
+        while f"Option_{n}" in existing_caps:
+            n += 1
+        export = f"Option_{n}"
         self._snapshot()
         page = self.view.doc[page_idx]
         w = fitz.Widget()
@@ -4309,45 +4348,26 @@ class MainWindow(QMainWindow):
         w.field_value = "Off"
         w.border_color = (0.4, 0.4, 0.4)
         page.add_widget(w)
-        # PyMuPDF hardcodes the on-state to /Yes for new radios — rewrite to
-        # the user's export value so kids in a group have distinct on-states.
         new_w = list(page.widgets())[-1]
         try:
             _set_radio_on_state(self.view.doc, new_w.xref, export)
         except Exception as exc:
             print(f"[radio] on-state rename failed: {exc}", file=sys.stderr)
-        # If 2+ radios now share this group, link them under a single parent
-        # so toggling one clears the others (PyMuPDF does NOT auto-link).
         try:
             _link_radio_group(self.view.doc, group)
         except Exception as exc:
             print(f"[radio] group link failed: {exc}", file=sys.stderr)
-        self.view.render_all(preserve_scroll=True)
-        self._mark_dirty()
-        self._refresh_form_panel()
-
-    def _prompt_choices(self, title: str):
-        name, ok = QInputDialog.getText(self, title, "Field name:")
-        if not ok or not name.strip():
-            return None, None
-        raw, ok = QInputDialog.getText(self, title, "Choices (comma-separated):")
-        if not ok:
-            return None, None
-        choices = [c.strip() for c in raw.split(",") if c.strip()]
-        if not choices:
-            return None, None
-        return name.strip(), choices
+        self._post_create_field(page_idx, new_w)
 
     def do_form_combo(self, page_idx: int, x0, y0, x1, y1):
         if x1 - x0 < 5 or y1 - y0 < 5:
             return
-        name, choices = self._prompt_choices("Dropdown")
-        if name is None:
-            return
+        # Default to a single placeholder choice; user edits via Options tab.
+        choices = ["Option 1"]
         self._snapshot()
         page = self.view.doc[page_idx]
         w = fitz.Widget()
-        w.field_name = name
+        w.field_name = _unique_field_name(self.view.doc, "Dropdown")
         w.field_type = fitz.PDF_WIDGET_TYPE_COMBOBOX
         w.rect = fitz.Rect(x0, y0, x1, y1)
         w.choice_values = choices
@@ -4356,20 +4376,16 @@ class MainWindow(QMainWindow):
         w.border_color = (0.4, 0.4, 0.4)
         w.fill_color = (1, 1, 1)
         page.add_widget(w)
-        self.view.render_all(preserve_scroll=True)
-        self._mark_dirty()
-        self._refresh_form_panel()
+        self._post_create_field(page_idx, w)
 
     def do_form_list(self, page_idx: int, x0, y0, x1, y1):
         if x1 - x0 < 5 or y1 - y0 < 5:
             return
-        name, choices = self._prompt_choices("List Box")
-        if name is None:
-            return
+        choices = ["Option 1"]
         self._snapshot()
         page = self.view.doc[page_idx]
         w = fitz.Widget()
-        w.field_name = name
+        w.field_name = _unique_field_name(self.view.doc, "ListBox")
         w.field_type = fitz.PDF_WIDGET_TYPE_LISTBOX
         w.rect = fitz.Rect(x0, y0, x1, y1)
         w.choice_values = choices
@@ -4378,39 +4394,29 @@ class MainWindow(QMainWindow):
         w.border_color = (0.4, 0.4, 0.4)
         w.fill_color = (1, 1, 1)
         page.add_widget(w)
-        self.view.render_all(preserve_scroll=True)
-        self._mark_dirty()
-        self._refresh_form_panel()
+        self._post_create_field(page_idx, w)
 
     def do_form_signature(self, page_idx: int, x0, y0, x1, y1):
         if x1 - x0 < 5 or y1 - y0 < 5:
             return
-        name, ok = QInputDialog.getText(self, "Signature Field", "Field name:")
-        if not ok or not name.strip():
-            return
         self._snapshot()
         page = self.view.doc[page_idx]
         w = fitz.Widget()
-        w.field_name = name.strip()
+        w.field_name = _unique_field_name(self.view.doc, "Signature")
         w.field_type = fitz.PDF_WIDGET_TYPE_SIGNATURE
         w.rect = fitz.Rect(x0, y0, x1, y1)
         w.border_color = (0.4, 0.4, 0.4)
         w.fill_color = (0.96, 0.96, 0.96)
         page.add_widget(w)
-        self.view.render_all(preserve_scroll=True)
-        self._mark_dirty()
-        self._refresh_form_panel()
+        self._post_create_field(page_idx, w)
 
     def do_form_date(self, page_idx: int, x0, y0, x1, y1):
         if x1 - x0 < 5 or y1 - y0 < 5:
             return
-        name, ok = QInputDialog.getText(self, "Date Field", "Field name:")
-        if not ok or not name.strip():
-            return
         self._snapshot()
         page = self.view.doc[page_idx]
         w = fitz.Widget()
-        w.field_name = name.strip()
+        w.field_name = _unique_field_name(self.view.doc, "Date")
         w.field_type = fitz.PDF_WIDGET_TYPE_TEXT
         w.rect = fitz.Rect(x0, y0, x1, y1)
         w.field_value = ""
@@ -4419,33 +4425,23 @@ class MainWindow(QMainWindow):
         w.border_color = (0.4, 0.4, 0.4)
         w.fill_color = (1, 1, 1)
         page.add_widget(w)
-        self.view.render_all(preserve_scroll=True)
-        self._mark_dirty()
-        self._refresh_form_panel()
+        self._post_create_field(page_idx, w)
 
     def do_form_button(self, page_idx: int, x0, y0, x1, y1):
         if x1 - x0 < 5 or y1 - y0 < 5:
             return
-        caption, ok = QInputDialog.getText(self, "Push Button", "Button caption:")
-        if not ok or not caption.strip():
-            return
-        name, ok = QInputDialog.getText(self, "Push Button", "Field name:")
-        if not ok or not name.strip():
-            return
         self._snapshot()
         page = self.view.doc[page_idx]
         w = fitz.Widget()
-        w.field_name = name.strip()
+        w.field_name = _unique_field_name(self.view.doc, "Button")
         w.field_type = fitz.PDF_WIDGET_TYPE_BUTTON
         w.rect = fitz.Rect(x0, y0, x1, y1)
-        w.button_caption = caption.strip()
+        w.button_caption = "Button"
         w.text_fontsize = max(8, int((y1 - y0) * 0.55))
         w.border_color = (0.4, 0.4, 0.4)
         w.fill_color = (0.9, 0.9, 0.9)
         page.add_widget(w)
-        self.view.render_all(preserve_scroll=True)
-        self._mark_dirty()
-        self._refresh_form_panel()
+        self._post_create_field(page_idx, w)
 
     # --- Form field editing (Phase 2) ---
     def _widget_at(self, page_idx: int, pdf_x: float, pdf_y: float):
@@ -4467,33 +4463,49 @@ class MainWindow(QMainWindow):
         return hit
 
     def edit_widget_properties(self, page_idx: int, widget):
-        """Open the FieldPropertiesDialog for `widget` and persist changes on OK."""
+        """Open the FieldPropertiesDialog for `widget` and persist changes on OK.
+
+        We re-resolve the widget under _bound_widget at apply time so the
+        annot binding is guaranteed live, even if `widget` was passed in
+        from a panel where the originating page reference has since been GC'd.
+        """
         if widget is None or not self.view.doc:
             return
-        dlg = FieldPropertiesDialog(widget, parent=self, doc=self.view.doc)
+        try:
+            xref = widget.xref
+        except Exception:
+            return
+        # Build the dialog against a freshly-resolved widget so its
+        # constructor reads from a live annot.
+        try:
+            with _bound_widget(self.view.doc, page_idx, xref) as (_page, w_init):
+                dlg = FieldPropertiesDialog(w_init, parent=self, doc=self.view.doc)
+        except Exception as exc:
+            QMessageBox.warning(self, "Field properties", f"Could not open: {exc}")
+            return
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         self._snapshot()
         try:
-            align_idx = dlg._apply_to_widget()
-            widget.update()
-            try:
-                # /Q (text alignment) lives outside fitz.Widget — write it directly.
-                self.view.doc.xref_set_key(widget.xref, "Q", str(int(align_idx)))
-            except Exception:
-                pass
-            # Radio: re-run linkage and rewrite on-state name if user changed it.
-            if widget.field_type == fitz.PDF_WIDGET_TYPE_RADIOBUTTON:
-                cap = widget.button_caption or ""
-                if cap and cap != "Off":
-                    try:
-                        _set_radio_on_state(self.view.doc, widget.xref, cap)
-                    except Exception as exc:
-                        print(f"[radio] on-state set failed: {exc}", file=sys.stderr)
+            with _bound_widget(self.view.doc, page_idx, xref) as (_page, w):
+                dlg.widget = w  # rebind so _apply_to_widget mutates the live annot
+                align_idx = dlg._apply_to_widget()
+                w.update()
                 try:
-                    _link_radio_group(self.view.doc, widget.field_name or "")
-                except Exception as exc:
-                    print(f"[radio] relink failed: {exc}", file=sys.stderr)
+                    self.view.doc.xref_set_key(w.xref, "Q", str(int(align_idx)))
+                except Exception:
+                    pass
+                if w.field_type == fitz.PDF_WIDGET_TYPE_RADIOBUTTON:
+                    cap = w.button_caption or ""
+                    if cap and cap != "Off":
+                        try:
+                            _set_radio_on_state(self.view.doc, w.xref, cap)
+                        except Exception as exc:
+                            print(f"[radio] on-state set failed: {exc}", file=sys.stderr)
+                    try:
+                        _link_radio_group(self.view.doc, w.field_name or "")
+                    except Exception as exc:
+                        print(f"[radio] relink failed: {exc}", file=sys.stderr)
         except Exception as exc:
             QMessageBox.warning(self, "Field properties", f"Could not apply: {exc}")
             if self._undo:
@@ -4538,17 +4550,121 @@ class MainWindow(QMainWindow):
         self._refresh_form_panel()
 
     def delete_widget(self, page_idx: int, widget):
-        """Remove `widget` from page `page_idx` (with snapshot + render)."""
+        """Remove `widget` from page `page_idx` (with snapshot + render).
+
+        The caller may pass a stale widget whose page binding has been GC'd.
+        We re-resolve via xref under _bound_widget so the delete always runs
+        against a live annot bound to a held page.
+        """
         if widget is None or not self.view.doc:
             return
         if page_idx < 0 or page_idx >= len(self.view.doc):
             return
-        page = self.view.doc[page_idx]
+        try:
+            xref = widget.xref
+        except Exception:
+            return
         self._snapshot()
         try:
-            page.delete_widget(widget)
+            with _bound_widget(self.view.doc, page_idx, xref) as (page, w):
+                page.delete_widget(w)
         except Exception as exc:
             QMessageBox.warning(self, "Delete field", f"Could not delete: {exc}")
+            if self._undo:
+                self._undo.pop()
+            return
+        self.view.render_all(preserve_scroll=True)
+        self._mark_dirty()
+        self._refresh_form_panel()
+
+    def reset_form(self) -> None:
+        """Clear every form field's value to its default state.
+
+        Text → "", checkbox → False, radio → "Off", combo/list → first
+        choice, signature/button → unchanged. Fields are not removed.
+
+        PyMuPDF silently ignores `widget.field_value = ""` for text fields
+        (you can replace one non-empty value with another, but can't clear
+        back to empty), so we fall back to writing /V=null on the xref
+        directly for those.
+        """
+        if not self.view.doc:
+            return
+        targets: list[tuple[int, int]] = []
+        for pi, w in self.collect_all_widgets():
+            try:
+                targets.append((pi, w.xref))
+            except Exception:
+                continue
+        if not targets:
+            return
+        self._snapshot()
+        try:
+            for pi, xref in targets:
+                with _bound_widget(self.view.doc, pi, xref) as (_page, ww):
+                    ft = ww.field_type
+                    if ft == fitz.PDF_WIDGET_TYPE_TEXT:
+                        try:
+                            self.view.doc.xref_set_key(xref, "V", "null")
+                        except Exception:
+                            pass
+                    elif ft == fitz.PDF_WIDGET_TYPE_CHECKBOX:
+                        ww.field_value = False
+                        ww.update()
+                    elif ft == fitz.PDF_WIDGET_TYPE_RADIOBUTTON:
+                        try:
+                            self.view.doc.xref_set_key(xref, "V", "/Off")
+                            self.view.doc.xref_set_key(xref, "AS", "/Off")
+                        except Exception:
+                            pass
+                    elif ft in (
+                        fitz.PDF_WIDGET_TYPE_COMBOBOX,
+                        fitz.PDF_WIDGET_TYPE_LISTBOX,
+                    ):
+                        choices = ww.choice_values or []
+                        if choices:
+                            first = choices[0]
+                            ww.field_value = (
+                                first if isinstance(first, str)
+                                else (first[-1] if first else "")
+                            )
+                            ww.update()
+        except Exception as exc:
+            QMessageBox.warning(self, "Reset Form", f"Could not reset: {exc}")
+            if self._undo:
+                self._undo.pop()
+            return
+        self.view.render_all(preserve_scroll=True)
+        self._mark_dirty()
+        self._refresh_form_panel()
+
+    def flatten_form(self) -> None:
+        """Bake all form widgets into static page content (no longer editable).
+
+        Uses PyMuPDF's doc.bake(annots=False, widgets=True) to convert
+        every widget's appearance stream into the page's content stream.
+        After this the document is no longer a Form PDF. Operation is
+        snapshot-undoable.
+        """
+        if not self.view.doc:
+            return
+        if not self.collect_all_widgets():
+            QMessageBox.information(self, "Flatten Form", "No form fields to flatten.")
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Flatten Form",
+            "Flatten all form fields into static page content? "
+            "This cannot be edited as form fields afterward (undo will restore).",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+        )
+        if confirm != QMessageBox.StandardButton.Ok:
+            return
+        self._snapshot()
+        try:
+            self.view.doc.bake(annots=False, widgets=True)
+        except Exception as exc:
+            QMessageBox.warning(self, "Flatten Form", f"Could not flatten: {exc}")
             if self._undo:
                 self._undo.pop()
             return
