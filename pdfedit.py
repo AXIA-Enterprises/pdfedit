@@ -19,10 +19,12 @@ from PyQt6.QtGui import (
     QBrush,
     QColor,
     QFont,
+    QGuiApplication,
     QImage,
     QKeySequence,
     QPainter,
     QPainterPath,
+    QPalette,
     QPen,
     QPixmap,
     QShortcut,
@@ -301,6 +303,467 @@ def parse_page_range(spec: str, max_pages: int) -> list[int]:
             if 1 <= p <= max_pages:
                 seen.add(p - 1)
     return sorted(seen)
+
+
+# ---------------------------------------------------------------------------
+# Theme system
+# ---------------------------------------------------------------------------
+
+LIGHT_PALETTE: dict[str, str] = {
+    "bg":            "#FFFFFF",
+    "surface":       "#F7F8FA",
+    "surface-2":     "#EEF1F5",
+    "border":        "#E1E5EB",
+    "border-strong": "#C8CFD9",
+    "text":          "#0F172A",
+    "text-muted":    "#5B6573",
+    "text-subtle":   "#8A94A6",
+    "accent":        "#2563EB",
+    "accent-hover":  "#1D4ED8",
+    "accent-soft":   "#EFF4FF",
+    "danger":        "#DC2626",
+    "success":       "#16A34A",
+}
+
+DARK_PALETTE: dict[str, str] = {
+    "bg":            "#0B0F17",
+    "surface":       "#111827",
+    "surface-2":     "#1A2233",
+    "border":        "#22304A",
+    "border-strong": "#2E3D5C",
+    "text":          "#E6EAF2",
+    "text-muted":    "#9AA4B8",
+    "text-subtle":   "#6B7588",
+    "accent":        "#3B82F6",
+    "accent-hover":  "#60A5FA",
+    "accent-soft":   "#162A4F",
+    "danger":        "#F87171",
+    "success":       "#34D399",
+}
+
+THEME_SETTINGS_KEY = "theme"
+THEME_VALID_NAMES = ("light", "dark", "system")
+
+UI_FONT_STACK = '-apple-system, "SF Pro Text", "Inter", "Segoe UI Variable", system-ui, sans-serif'
+MONO_FONT_STACK = '"SF Mono", "JetBrains Mono", "Menlo", monospace'
+UI_FONT_PT = 13
+
+_active_palette: dict[str, str] = LIGHT_PALETTE
+_active_theme_name: str = "light"
+
+
+def _resolve_system_theme() -> str:
+    """Return 'light' or 'dark' based on OS preference; fall back to light."""
+    try:
+        hints = QGuiApplication.styleHints()
+        scheme = hints.colorScheme()
+        from PyQt6.QtCore import Qt as _Qt
+        if scheme == _Qt.ColorScheme.Dark:
+            return "dark"
+    except Exception:
+        pass
+    return "light"
+
+
+def _palette_for(name: str) -> tuple[str, dict[str, str]]:
+    if name == "system":
+        resolved = _resolve_system_theme()
+        return resolved, (DARK_PALETTE if resolved == "dark" else LIGHT_PALETTE)
+    if name == "dark":
+        return "dark", DARK_PALETTE
+    return "light", LIGHT_PALETTE
+
+
+def _build_qss(p: dict[str, str]) -> str:
+    return f"""
+* {{
+    font-family: {UI_FONT_STACK};
+    font-size: {UI_FONT_PT}pt;
+}}
+QWidget {{
+    background-color: {p['bg']};
+    color: {p['text']};
+}}
+QMainWindow, QDialog {{
+    background-color: {p['bg']};
+    color: {p['text']};
+}}
+QToolTip {{
+    background-color: {p['surface-2']};
+    color: {p['text']};
+    border: 1px solid {p['border']};
+    border-radius: 4px;
+    padding: 4px 8px;
+}}
+
+/* ---- Toolbars ---- */
+QToolBar {{
+    background-color: {p['surface']};
+    border: 0px;
+    border-bottom: 1px solid {p['border']};
+    padding: 4px 6px;
+    spacing: 2px;
+}}
+QToolBar::separator {{
+    background: {p['border']};
+    width: 1px;
+    margin: 4px 6px;
+}}
+QToolButton {{
+    background: transparent;
+    color: {p['text']};
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 6px 12px;
+}}
+QToolButton:hover {{
+    background-color: {p['surface-2']};
+    border-color: {p['border']};
+}}
+QToolButton:pressed, QToolButton:checked {{
+    background-color: {p['accent-soft']};
+    border-color: {p['accent']};
+    color: {p['accent']};
+}}
+QToolButton::menu-indicator {{ image: none; width: 0px; }}
+
+/* ---- Menu bar / Menus ---- */
+QMenuBar {{
+    background-color: {p['surface']};
+    color: {p['text']};
+    border-bottom: 1px solid {p['border']};
+    padding: 2px 4px;
+}}
+QMenuBar::item {{
+    background: transparent;
+    padding: 6px 10px;
+    border-radius: 4px;
+}}
+QMenuBar::item:selected {{
+    background-color: {p['surface-2']};
+}}
+QMenu {{
+    background-color: {p['surface']};
+    color: {p['text']};
+    border: 1px solid {p['border']};
+    border-radius: 4px;
+    padding: 4px;
+}}
+QMenu::item {{
+    padding: 6px 14px;
+    border-radius: 4px;
+}}
+QMenu::item:selected {{
+    background-color: {p['accent-soft']};
+    color: {p['text']};
+}}
+QMenu::separator {{
+    height: 1px;
+    background: {p['border']};
+    margin: 4px 6px;
+}}
+
+/* ---- Buttons ---- */
+QPushButton {{
+    background-color: {p['surface']};
+    color: {p['text']};
+    border: 1px solid {p['border']};
+    border-radius: 6px;
+    padding: 6px 14px;
+    min-height: 18px;
+}}
+QPushButton:hover {{
+    background-color: {p['surface-2']};
+    border-color: {p['border-strong']};
+}}
+QPushButton:pressed {{
+    background-color: {p['surface-2']};
+}}
+QPushButton:disabled {{
+    color: {p['text-subtle']};
+    background-color: {p['surface']};
+    border-color: {p['border']};
+}}
+QPushButton:default {{
+    background-color: {p['accent']};
+    color: #FFFFFF;
+    border-color: {p['accent']};
+}}
+QPushButton:default:hover {{
+    background-color: {p['accent-hover']};
+    border-color: {p['accent-hover']};
+}}
+
+/* ---- Inputs ---- */
+QLineEdit, QPlainTextEdit, QTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
+    background-color: {p['bg']};
+    color: {p['text']};
+    selection-background-color: {p['accent']};
+    selection-color: #FFFFFF;
+    border: 1px solid {p['border']};
+    border-radius: 6px;
+    padding: 4px 8px;
+}}
+QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus,
+QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {{
+    border: 2px solid {p['accent']};
+    padding: 3px 7px;
+}}
+QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled {{
+    color: {p['text-subtle']};
+    background-color: {p['surface']};
+}}
+QComboBox::drop-down {{
+    border: 0px;
+    width: 18px;
+}}
+QComboBox QAbstractItemView {{
+    background-color: {p['surface']};
+    color: {p['text']};
+    border: 1px solid {p['border']};
+    selection-background-color: {p['accent-soft']};
+    selection-color: {p['text']};
+    outline: 0;
+}}
+
+/* ---- Checkboxes / Radios ---- */
+QCheckBox, QRadioButton {{
+    background: transparent;
+    color: {p['text']};
+    spacing: 6px;
+}}
+
+/* ---- Labels ---- */
+QLabel {{
+    background: transparent;
+    color: {p['text']};
+}}
+
+/* ---- Dock widgets ---- */
+QDockWidget {{
+    color: {p['text']};
+    titlebar-close-icon: none;
+}}
+QDockWidget::title {{
+    background-color: {p['surface']};
+    color: {p['text-muted']};
+    padding: 6px 10px;
+    border-bottom: 1px solid {p['border']};
+}}
+
+/* ---- Tabs ---- */
+QTabWidget::pane {{
+    border: 1px solid {p['border']};
+    border-radius: 6px;
+    background-color: {p['bg']};
+    top: -1px;
+}}
+QTabBar::tab {{
+    background: transparent;
+    color: {p['text-muted']};
+    padding: 6px 14px;
+    border: 1px solid transparent;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+}}
+QTabBar::tab:selected {{
+    color: {p['text']};
+    background-color: {p['bg']};
+    border: 1px solid {p['border']};
+    border-bottom-color: {p['bg']};
+}}
+QTabBar::tab:hover:!selected {{
+    color: {p['text']};
+    background-color: {p['surface-2']};
+}}
+
+/* ---- Tree / List ---- */
+QTreeWidget, QListWidget, QTreeView, QListView {{
+    background-color: {p['bg']};
+    alternate-background-color: {p['surface']};
+    color: {p['text']};
+    border: 1px solid {p['border']};
+    border-radius: 6px;
+    outline: 0;
+}}
+QTreeWidget::item, QListWidget::item, QTreeView::item, QListView::item {{
+    padding: 4px 6px;
+    border: 0;
+}}
+QTreeWidget::item:selected, QListWidget::item:selected,
+QTreeView::item:selected, QListView::item:selected {{
+    background-color: {p['accent-soft']};
+    color: {p['text']};
+    border-left: 2px solid {p['accent']};
+}}
+QHeaderView::section {{
+    background-color: {p['surface']};
+    color: {p['text-muted']};
+    border: 0;
+    border-right: 1px solid {p['border']};
+    border-bottom: 1px solid {p['border']};
+    padding: 6px 8px;
+}}
+
+/* ---- Status bar ---- */
+QStatusBar {{
+    background-color: {p['surface']};
+    color: {p['text-muted']};
+    border-top: 1px solid {p['border']};
+}}
+QStatusBar QLabel {{
+    color: {p['text-muted']};
+}}
+
+/* ---- Scrollbars ---- */
+QScrollBar:vertical {{
+    background: transparent;
+    width: 10px;
+    margin: 2px;
+}}
+QScrollBar:horizontal {{
+    background: transparent;
+    height: 10px;
+    margin: 2px;
+}}
+QScrollBar::handle:vertical, QScrollBar::handle:horizontal {{
+    background: {p['border-strong']};
+    border-radius: 4px;
+    min-width: 24px;
+    min-height: 24px;
+}}
+QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {{
+    background: {p['text-subtle']};
+}}
+QScrollBar::add-line, QScrollBar::sub-line {{
+    background: transparent;
+    border: 0;
+    width: 0;
+    height: 0;
+}}
+QScrollBar::add-page, QScrollBar::sub-page {{
+    background: transparent;
+}}
+
+/* ---- Splitter ---- */
+QSplitter::handle {{
+    background-color: {p['border']};
+}}
+QSplitter::handle:horizontal {{ width: 1px; }}
+QSplitter::handle:vertical {{ height: 1px; }}
+
+/* ---- Group box ---- */
+QGroupBox {{
+    border: 1px solid {p['border']};
+    border-radius: 6px;
+    margin-top: 14px;
+    padding-top: 8px;
+    color: {p['text']};
+}}
+QGroupBox::title {{
+    subcontrol-origin: margin;
+    left: 10px;
+    padding: 0 6px;
+    color: {p['text-muted']};
+}}
+
+/* ---- Slider ---- */
+QSlider::groove:horizontal {{
+    height: 4px;
+    background: {p['border']};
+    border-radius: 2px;
+}}
+QSlider::handle:horizontal {{
+    background: {p['accent']};
+    width: 14px;
+    margin: -6px 0;
+    border-radius: 7px;
+}}
+"""
+
+
+def _qpalette_for(p: dict[str, str]) -> QPalette:
+    """Build a QPalette so native dialogs (file/color) blend with the theme."""
+    qp = QPalette()
+    bg = QColor(p["bg"])
+    surface = QColor(p["surface"])
+    text = QColor(p["text"])
+    muted = QColor(p["text-muted"])
+    accent = QColor(p["accent"])
+    border = QColor(p["border"])
+    qp.setColor(QPalette.ColorRole.Window, bg)
+    qp.setColor(QPalette.ColorRole.WindowText, text)
+    qp.setColor(QPalette.ColorRole.Base, bg)
+    qp.setColor(QPalette.ColorRole.AlternateBase, surface)
+    qp.setColor(QPalette.ColorRole.ToolTipBase, surface)
+    qp.setColor(QPalette.ColorRole.ToolTipText, text)
+    qp.setColor(QPalette.ColorRole.Text, text)
+    qp.setColor(QPalette.ColorRole.Button, surface)
+    qp.setColor(QPalette.ColorRole.ButtonText, text)
+    qp.setColor(QPalette.ColorRole.BrightText, QColor("#FFFFFF"))
+    qp.setColor(QPalette.ColorRole.Highlight, accent)
+    qp.setColor(QPalette.ColorRole.HighlightedText, QColor("#FFFFFF"))
+    qp.setColor(QPalette.ColorRole.PlaceholderText, QColor(p["text-subtle"]))
+    qp.setColor(QPalette.ColorRole.Mid, border)
+    qp.setColor(QPalette.ColorRole.Dark, QColor(p["border-strong"]))
+    qp.setColor(QPalette.ColorRole.Shadow, QColor("#000000"))
+    qp.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, muted)
+    qp.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, muted)
+    qp.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, muted)
+    return qp
+
+
+def apply_theme(app: "QApplication", name: str) -> None:
+    """Apply the named theme ('light' / 'dark' / 'system') to `app`."""
+    global _active_palette, _active_theme_name
+    if name not in THEME_VALID_NAMES:
+        name = "system"
+    resolved, palette = _palette_for(name)
+    _active_palette = palette
+    _active_theme_name = resolved
+    if app is None:
+        return
+    try:
+        font = QFont()
+        font.setPointSize(UI_FONT_PT)
+        app.setFont(font)
+    except Exception:
+        pass
+    try:
+        app.setPalette(_qpalette_for(palette))
+    except Exception:
+        pass
+    app.setStyleSheet(_build_qss(palette))
+
+
+def current_theme_name() -> str:
+    """Read the persisted theme preference; defaults to 'system'."""
+    try:
+        s = QSettings()
+        v = s.value(THEME_SETTINGS_KEY, "system")
+        if isinstance(v, str) and v in THEME_VALID_NAMES:
+            return v
+    except Exception:
+        pass
+    return "system"
+
+
+def set_theme(app: "QApplication", name: str) -> None:
+    """Persist `name` under QSettings and apply it to `app`."""
+    if name not in THEME_VALID_NAMES:
+        name = "system"
+    try:
+        s = QSettings()
+        s.setValue(THEME_SETTINGS_KEY, name)
+    except Exception:
+        pass
+    apply_theme(app, name)
+
+
+def current_accent_color() -> QColor:
+    """Return the active theme's accent color as a QColor (with alpha 220)."""
+    c = QColor(_active_palette.get("accent", "#2563EB"))
+    return c
 
 
 class WatermarkDialog(QDialog):
@@ -3251,14 +3714,8 @@ class MainWindow(QMainWindow):
         # We use this rather than a second QMenuBar because Qt on macOS won't
         # render a non-native QMenuBar widget reliably alongside the native one.
         self.in_app_menubar = QToolBar("Menus")
+        self.in_app_menubar.setObjectName("InAppMenuBar")
         self.in_app_menubar.setMovable(False)
-        mb_font = self.in_app_menubar.font()
-        mb_font.setPointSize(mb_font.pointSize() + 2)
-        self.in_app_menubar.setFont(mb_font)
-        self.in_app_menubar.setStyleSheet(
-            "QToolButton { padding: 6px 10px; }"
-            "QToolButton::menu-indicator { image: none; width: 0px; }"
-        )
         for label, items in menu_spec:
             btn = QToolButton(self.in_app_menubar)
             btn.setText(label.replace("&", ""))
@@ -3270,15 +3727,8 @@ class MainWindow(QMainWindow):
 
         # ---- Slim toolbar: page nav, tool modes, find ----
         tb = QToolBar("Main")
+        tb.setObjectName("MainToolBar")
         tb.setMovable(False)
-        tb_font = tb.font()
-        tb_font.setPointSize(tb_font.pointSize() + 2)
-        tb.setFont(tb_font)
-        tb.setStyleSheet(
-            "QToolButton { padding: 6px 10px; }"
-            "QToolBar QLabel { padding: 0 6px; }"
-            "QLineEdit { padding: 4px 6px; }"
-        )
         # Stack: menu strip on top, tool toolbar below.
         self.addToolBar(self.in_app_menubar)
         self.addToolBarBreak()
@@ -3318,13 +3768,8 @@ class MainWindow(QMainWindow):
 
         # ---- Format toolbar (third row) ----
         fmt = QToolBar("Format")
+        fmt.setObjectName("FormatToolBar")
         fmt.setMovable(False)
-        fmt.setFont(tb_font)
-        fmt.setStyleSheet(
-            "QToolButton { padding: 6px 10px; }"
-            "QToolBar QLabel { padding: 0 6px; }"
-            "QComboBox, QSpinBox { padding: 2px 6px; }"
-        )
         self.addToolBarBreak()
         self.addToolBar(fmt)
         self.fmt_toolbar = fmt
@@ -4764,10 +5209,15 @@ class MainWindow(QMainWindow):
         item = getattr(self, "_widget_highlight_item", None)
         if item is None or item.scene() is not self.view.scene_:
             item = QGraphicsRectItem()
-            pen = QPen(QColor(30, 120, 255, 220))
+            accent = current_accent_color()
+            pen_color = QColor(accent)
+            pen_color.setAlpha(220)
+            brush_color = QColor(accent)
+            brush_color.setAlpha(40)
+            pen = QPen(pen_color)
             pen.setWidth(3)
             item.setPen(pen)
-            item.setBrush(QBrush(QColor(30, 120, 255, 40)))
+            item.setBrush(QBrush(brush_color))
             item.setZValue(10000)
             self.view.scene_.addItem(item)
             self._widget_highlight_item = item
@@ -4937,6 +5387,7 @@ def main():
     QApplication.setApplicationName(APP_NAME)
     app = _PDFApp(sys.argv)
     app.setApplicationDisplayName("Basic PDF Editor")
+    apply_theme(app, current_theme_name())
     win = MainWindow()
     win.show()
     app.set_window(win)
