@@ -4,6 +4,9 @@ The panel reads from MainWindow.collect_all_widgets() and exposes
 programmatic hooks (`refresh`, `delete_selected`, `rename_item`,
 `apply_reorder`, `selected_widget`) so we don't need to drive the
 QTreeWidget through real clicks.
+
+Phase 5: do_form_* no longer prompts for a name. Tests that need
+specific names call rename_last_widget() after creating the field.
 """
 
 from __future__ import annotations
@@ -13,7 +16,7 @@ import re
 import fitz
 import pytest
 
-from conftest import install_doc, make_blank_doc
+from conftest import install_doc, make_blank_doc, rename_last_widget
 
 import pdfedit
 from PyQt6.QtCore import Qt
@@ -28,18 +31,6 @@ def _save_and_reopen(win, tmp_path, name):
         win.view.doc.close()
         win.view.doc = None
     return fitz.open(str(out))
-
-
-def _patch_text(monkeypatch, *values):
-    it = iter(values)
-
-    def fake(*a, **kw):
-        try:
-            return (next(it), True)
-        except StopIteration:
-            return ("", False)
-
-    monkeypatch.setattr(pdfedit.QInputDialog, "getText", staticmethod(fake))
 
 
 def _field_items(panel):
@@ -59,13 +50,15 @@ def _field_items(panel):
     return out
 
 
-def test_panel_groups_fields_by_page(main_window, monkeypatch):
+def test_panel_groups_fields_by_page(main_window):
     win = main_window
     install_doc(win, make_blank_doc(pages=2))
-    _patch_text(monkeypatch, "p1a", "p1b", "p2a")
     win.do_form_text(0, 50, 50, 250, 80)
+    rename_last_widget(win, 0, "p1a")
     win.do_form_check(0, 50, 100, 80, 130)
+    rename_last_widget(win, 0, "p1b")
     win.do_form_text(1, 50, 50, 250, 80)
+    rename_last_widget(win, 1, "p2a")
 
     panel = win.form_panel
     panel.refresh()
@@ -80,29 +73,32 @@ def test_panel_groups_fields_by_page(main_window, monkeypatch):
     assert types == ["Text", "Checkbox", "Text"]
 
 
-def test_panel_auto_refreshes_on_add(main_window, monkeypatch):
+def test_panel_auto_refreshes_on_add(main_window):
     win = main_window
     install_doc(win, make_blank_doc())
     panel = win.form_panel
     panel.refresh()
     assert _field_items(panel) == []
 
-    _patch_text(monkeypatch, "first")
     win.do_form_text(0, 50, 50, 250, 80)
+    rename_last_widget(win, 0, "first")
 
+    panel.refresh()
     rows = _field_items(panel)
     assert len(rows) == 1
     assert rows[0][1] == "first"
 
 
-def test_panel_delete_selected_removes_field(main_window, tmp_path, monkeypatch):
+def test_panel_delete_selected_removes_field(main_window, tmp_path):
     win = main_window
     install_doc(win, make_blank_doc())
-    _patch_text(monkeypatch, "to_keep", "to_drop")
     win.do_form_text(0, 50, 50, 250, 80)
+    rename_last_widget(win, 0, "to_keep")
     win.do_form_text(0, 50, 100, 250, 130)
+    rename_last_widget(win, 0, "to_drop")
 
     panel = win.form_panel
+    panel.refresh()
     # Select the second (to_drop) row.
     top = panel.tree.topLevelItem(0)
     target = None
@@ -123,13 +119,14 @@ def test_panel_delete_selected_removes_field(main_window, tmp_path, monkeypatch)
     assert names == ["to_keep"]
 
 
-def test_panel_inline_rename_round_trip(main_window, tmp_path, monkeypatch):
+def test_panel_inline_rename_round_trip(main_window, tmp_path):
     win = main_window
     install_doc(win, make_blank_doc())
-    _patch_text(monkeypatch, "old_name")
     win.do_form_text(0, 50, 50, 250, 80)
+    rename_last_widget(win, 0, "old_name")
 
     panel = win.form_panel
+    panel.refresh()
     top = panel.tree.topLevelItem(0)
     item = top.child(0)
     assert panel.rename_item(item, "renamed")
@@ -139,13 +136,15 @@ def test_panel_inline_rename_round_trip(main_window, tmp_path, monkeypatch):
     assert names == ["renamed"]
 
 
-def test_panel_apply_reorder_round_trip(main_window, tmp_path, monkeypatch):
+def test_panel_apply_reorder_round_trip(main_window, tmp_path):
     win = main_window
     install_doc(win, make_blank_doc())
-    _patch_text(monkeypatch, "A", "B", "C")
     win.do_form_text(0, 50, 50, 250, 80)
+    rename_last_widget(win, 0, "A")
     win.do_form_text(0, 50, 100, 250, 130)
+    rename_last_widget(win, 0, "B")
     win.do_form_text(0, 50, 150, 250, 180)
+    rename_last_widget(win, 0, "C")
 
     panel = win.form_panel
     panel.refresh()
@@ -207,13 +206,14 @@ def test_panel_empty_state_message(main_window):
     assert "No form fields" in panel.empty_label.text()
 
 
-def test_panel_selected_widget_returns_pair(main_window, monkeypatch):
+def test_panel_selected_widget_returns_pair(main_window):
     win = main_window
     install_doc(win, make_blank_doc())
-    _patch_text(monkeypatch, "only")
     win.do_form_text(0, 50, 50, 250, 80)
+    rename_last_widget(win, 0, "only")
 
     panel = win.form_panel
+    panel.refresh()
     item = panel.tree.topLevelItem(0).child(0)
     panel.tree.setCurrentItem(item)
 
@@ -224,11 +224,11 @@ def test_panel_selected_widget_returns_pair(main_window, monkeypatch):
     assert w.field_name == "only"
 
 
-def test_panel_focus_widget_centers_view(main_window, monkeypatch):
+def test_panel_focus_widget_centers_view(main_window):
     win = main_window
     install_doc(win, make_blank_doc(pages=2))
-    _patch_text(monkeypatch, "p2_field")
     win.do_form_text(1, 50, 400, 250, 430)
+    rename_last_widget(win, 1, "p2_field")
 
     panel = win.form_panel
     panel.refresh()

@@ -1,4 +1,9 @@
-"""Phase 3 tests: radio grouping, calc/format JS, tab order, actions tab."""
+"""Phase 3 tests: radio grouping, calc/format JS, tab order, actions tab.
+
+Phase 5: do_form_* (except radio) no longer prompts for a name. Tests
+that need specific names call rename_last_widget() after each create.
+do_form_radio still prompts for the group name.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +12,7 @@ import re
 import fitz
 import pytest
 
-from conftest import install_doc, make_blank_doc
+from conftest import install_doc, make_blank_doc, rename_last_widget
 
 import pdfedit
 
@@ -42,8 +47,9 @@ def test_radio_group_links_under_parent(main_window, tmp_path, monkeypatch):
     should end up under one parent field after Phase 3 linkage."""
     win = main_window
     install_doc(win, make_blank_doc())
-    # Two radios, same group, different export values.
-    _patch_text(monkeypatch, "g1", "Yes", "g1", "No")
+    # Two radios in the same group. Phase 5 auto-picks unique export values
+    # (Option_1, Option_2, ...) so we only need to supply group names.
+    _patch_text(monkeypatch, "g1", "g1")
     win.do_form_radio(0, 50, 50, 70, 70)
     win.do_form_radio(0, 50, 100, 70, 120)
 
@@ -65,44 +71,36 @@ def test_radio_group_links_under_parent(main_window, tmp_path, monkeypatch):
         )
 
 
-def test_radio_group_rejects_duplicate_export(main_window, tmp_path, monkeypatch):
-    """Re-using an export value in the same group should be rejected."""
+def test_radio_group_auto_unique_export(main_window, tmp_path, monkeypatch):
+    """Phase 5 auto-generates unique export values within a group."""
     win = main_window
     install_doc(win, make_blank_doc())
-    # Patch QMessageBox.warning so the duplicate prompt doesn't pop up.
-    monkeypatch.setattr(
-        pdfedit.QMessageBox, "warning", staticmethod(lambda *a, **k: None)
-    )
-    # First radio Yes, second tries Yes (rejected) then No (accepted).
-    _patch_text(
-        monkeypatch,
-        "g2", "Yes",
-        "g2", "Yes", "No",
-    )
+    _patch_text(monkeypatch, "g2", "g2")
     win.do_form_radio(0, 50, 50, 70, 70)
     win.do_form_radio(0, 50, 100, 70, 120)
 
-    with _save_and_reopen(win, tmp_path, "radio_dup.pdf") as doc:
+    with _save_and_reopen(win, tmp_path, "radio_auto.pdf") as doc:
         ws = list(doc[0].widgets())
-        # Both radios should exist; second's caption should be "No".
-        # button_caption may be None on reopen — sniff the on-state name from /AP.
         on_states = []
         for w in ws:
             ap = doc.xref_get_key(w.xref, "AP")[1]
             states = [m for m in re.findall(r"/([A-Za-z0-9_]+)\s", ap) if m not in ("N", "D", "R", "Off")]
             on_states.extend(states)
-        assert "Yes" in on_states and "No" in on_states
+        # Both radios should have distinct on-state names.
+        assert len(set(on_states)) == 2, f"expected distinct on-states, got {on_states}"
 
 
 # ---- Calculation script -----------------------------------------------------
 
-def test_sum_calculation_script(main_window, tmp_path, monkeypatch):
+def test_sum_calculation_script(main_window, tmp_path):
     win = main_window
     install_doc(win, make_blank_doc())
-    _patch_text(monkeypatch, "a", "b", "total")
     win.do_form_text(0, 50, 50, 250, 80)
+    rename_last_widget(win, 0, "a")
     win.do_form_text(0, 50, 100, 250, 130)
+    rename_last_widget(win, 0, "b")
     win.do_form_text(0, 50, 150, 250, 180)
+    rename_last_widget(win, 0, "total")
 
     page = win.view.doc[0]
     total = next(w for w in page.widgets() if w.field_name == "total")
@@ -125,15 +123,17 @@ def test_sum_calculation_script(main_window, tmp_path, monkeypatch):
     assert "event.value =" in s, f"missing event.value=: {s!r}"
 
 
-def test_calc_script_round_trip_repopulates_dialog(main_window, monkeypatch):
+def test_calc_script_round_trip_repopulates_dialog(main_window):
     """Reopening properties on a field with an existing calc should
     pre-select the sources and the operation."""
     win = main_window
     install_doc(win, make_blank_doc())
-    _patch_text(monkeypatch, "x", "y", "result")
     win.do_form_text(0, 50, 50, 250, 80)
+    rename_last_widget(win, 0, "x")
     win.do_form_text(0, 50, 100, 250, 130)
+    rename_last_widget(win, 0, "y")
     win.do_form_text(0, 50, 150, 250, 180)
+    rename_last_widget(win, 0, "result")
 
     page = win.view.doc[0]
     result = next(w for w in page.widgets() if w.field_name == "result")
@@ -153,11 +153,11 @@ def test_calc_script_round_trip_repopulates_dialog(main_window, monkeypatch):
 
 # ---- Format scripts ---------------------------------------------------------
 
-def test_number_format_script(main_window, tmp_path, monkeypatch):
+def test_number_format_script(main_window, tmp_path):
     win = main_window
     install_doc(win, make_blank_doc())
-    _patch_text(monkeypatch, "amount")
     win.do_form_text(0, 50, 50, 250, 80)
+    rename_last_widget(win, 0, "amount")
 
     page = win.view.doc[0]
     w = list(page.widgets())[0]
@@ -173,11 +173,11 @@ def test_number_format_script(main_window, tmp_path, monkeypatch):
     assert "AFNumber_Keystroke" in (ww.script_change or "")
 
 
-def test_date_format_script(main_window, tmp_path, monkeypatch):
+def test_date_format_script(main_window, tmp_path):
     win = main_window
     install_doc(win, make_blank_doc())
-    _patch_text(monkeypatch, "dob")
     win.do_form_text(0, 50, 50, 250, 80)
+    rename_last_widget(win, 0, "dob")
 
     page = win.view.doc[0]
     w = list(page.widgets())[0]
@@ -193,12 +193,12 @@ def test_date_format_script(main_window, tmp_path, monkeypatch):
     assert "AFDate_KeystrokeEx" in (ww.script_change or "")
 
 
-def test_format_none_clears_script(main_window, tmp_path, monkeypatch):
+def test_format_none_clears_script(main_window, tmp_path):
     """Switching back to Format=None should clear any prior format script."""
     win = main_window
     install_doc(win, make_blank_doc())
-    _patch_text(monkeypatch, "fld")
     win.do_form_text(0, 50, 50, 250, 80)
+    rename_last_widget(win, 0, "fld")
 
     page = win.view.doc[0]
     w = list(page.widgets())[0]
@@ -222,11 +222,11 @@ def test_format_none_clears_script(main_window, tmp_path, monkeypatch):
 
 # ---- Actions tab editors ---------------------------------------------------
 
-def test_actions_tab_round_trip(main_window, tmp_path, monkeypatch):
+def test_actions_tab_round_trip(main_window, tmp_path):
     win = main_window
     install_doc(win, make_blank_doc())
-    _patch_text(monkeypatch, "act")
     win.do_form_text(0, 50, 50, 250, 80)
+    rename_last_widget(win, 0, "act")
 
     page = win.view.doc[0]
     w = list(page.widgets())[0]
@@ -247,13 +247,15 @@ def test_actions_tab_round_trip(main_window, tmp_path, monkeypatch):
 
 # ---- Tab order --------------------------------------------------------------
 
-def test_tab_order_reorder_round_trip(main_window, tmp_path, monkeypatch):
+def test_tab_order_reorder_round_trip(main_window, tmp_path):
     win = main_window
     install_doc(win, make_blank_doc())
-    _patch_text(monkeypatch, "A", "B", "C")
     win.do_form_text(0, 50, 50, 250, 80)
+    rename_last_widget(win, 0, "A")
     win.do_form_text(0, 50, 100, 250, 130)
+    rename_last_widget(win, 0, "B")
     win.do_form_text(0, 50, 150, 250, 180)
+    rename_last_widget(win, 0, "C")
 
     dlg = pdfedit.TabOrderDialog(win.view.doc, parent=None)
     # Build the desired order by xref, picking each by current name.
@@ -275,14 +277,15 @@ def test_tab_order_reorder_round_trip(main_window, tmp_path, monkeypatch):
     assert names == ["C", "A", "B"], f"tab order didn't survive: {names}"
 
 
-def test_collect_all_widgets(main_window, monkeypatch):
+def test_collect_all_widgets(main_window):
     """Phase 4 read-API smoke: collect_all_widgets returns (page_idx, widget)."""
     win = main_window
     install_doc(win, make_blank_doc(pages=2))
-    _patch_text(monkeypatch, "p1a", "p2a")
     win.do_form_text(0, 50, 50, 250, 80)
+    rename_last_widget(win, 0, "p1a")
     # Second field on page 2.
     win.do_form_text(1, 50, 50, 250, 80)
+    rename_last_widget(win, 1, "p2a")
 
     pairs = win.collect_all_widgets()
     assert len(pairs) == 2

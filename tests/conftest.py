@@ -24,6 +24,15 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import pdfedit  # noqa: E402
 
+# Phase 5: do_form_* now auto-opens FieldPropertiesDialog after creation,
+# which calls .exec() and blocks under the offscreen test platform. Patch
+# at module load time (before any test class is collected) so even tests
+# that don't use the autouse fixture get a non-blocking dialog.
+from PyQt6.QtWidgets import QDialog as _QDialog  # noqa: E402
+
+_original_field_props_exec = pdfedit.FieldPropertiesDialog.exec
+pdfedit.FieldPropertiesDialog.exec = lambda self: _QDialog.DialogCode.Rejected
+
 
 @pytest.fixture(scope="session", autouse=True)
 def _disable_unsaved_changes_dialog():
@@ -41,6 +50,8 @@ def _disable_unsaved_changes_dialog():
     pdfedit.MainWindow.closeEvent = lambda self, ev: ev.accept()
     yield
     pdfedit.MainWindow.closeEvent = original
+
+
 
 
 @pytest.fixture(scope="session")
@@ -147,6 +158,23 @@ def make_blank_doc(width_pt: float = 612.0, height_pt: float = 792.0, pages: int
     for _ in range(pages):
         doc.new_page(width=width_pt, height=height_pt)
     return doc
+
+
+def rename_last_widget(win, page_idx: int, new_name: str) -> None:
+    """Rename the most recently added widget on `page_idx` to `new_name`.
+
+    Many phase 1-4 tests created a field then asserted on a specific
+    field_name. After phase 5's auto-naming refactor, do_form_* picks
+    a unique default like "Text_1"; tests that need a specific name
+    call this helper after each do_form_* to set it.
+    """
+    page = win.view.doc[page_idx]
+    widgets = list(page.widgets())
+    if not widgets:
+        raise AssertionError(f"no widgets on page {page_idx} to rename")
+    w = widgets[-1]
+    w.field_name = new_name
+    w.update()
 
 
 def install_doc(win, doc):
