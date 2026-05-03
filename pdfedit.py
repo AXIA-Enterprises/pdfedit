@@ -1549,8 +1549,22 @@ class PDFView(QGraphicsView):
             self.window_.do_sticky(page, sx, sy)
         elif mode == "form-text":
             self.window_.do_form_text(page, rx0, ry0, rx1, ry1)
+        elif mode == "form-multiline":
+            self.window_.do_form_multiline(page, rx0, ry0, rx1, ry1)
         elif mode == "form-check":
             self.window_.do_form_check(page, rx0, ry0, rx1, ry1)
+        elif mode == "form-radio":
+            self.window_.do_form_radio(page, rx0, ry0, rx1, ry1)
+        elif mode == "form-combo":
+            self.window_.do_form_combo(page, rx0, ry0, rx1, ry1)
+        elif mode == "form-list":
+            self.window_.do_form_list(page, rx0, ry0, rx1, ry1)
+        elif mode == "form-signature":
+            self.window_.do_form_signature(page, rx0, ry0, rx1, ry1)
+        elif mode == "form-date":
+            self.window_.do_form_date(page, rx0, ry0, rx1, ry1)
+        elif mode == "form-button":
+            self.window_.do_form_button(page, rx0, ry0, rx1, ry1)
 
     def wheelEvent(self, ev):
         mods = ev.modifiers()
@@ -1727,7 +1741,14 @@ class MainWindow(QMainWindow):
             "erase": "Drag a rectangle to white out (redact) content. (E)",
             "image": "Click on the page to insert an image file. (I)",
             "form-text": "Drag to add a fillable text field.",
+            "form-multiline": "Drag to add a multi-line text field.",
             "form-check": "Drag to add a checkbox.",
+            "form-radio": "Drag to add a radio button (group siblings by name). (R)",
+            "form-combo": "Drag to add a dropdown. (D)",
+            "form-list": "Drag to add a list box.",
+            "form-signature": "Drag to add a signature field for the recipient.",
+            "form-date": "Drag to add a date field.",
+            "form-button": "Drag to add a push button. (B)",
         }
         # Single-key shortcuts. We gate them at the QShortcut level (see
         # _install_tool_shortcuts) so they don't fire while typing into a
@@ -1742,6 +1763,15 @@ class MainWindow(QMainWindow):
             "sticky": "N",
             "erase": "E",
             "image": "I",
+            "form-radio": "R",
+            "form-combo": "D",
+            "form-button": "B",
+        }
+        self._form_actions: list[QAction] = []
+        form_modes = {
+            "form-text", "form-multiline", "form-check", "form-radio",
+            "form-combo", "form-list", "form-signature", "form-date",
+            "form-button",
         }
         for label, mode in (
             ("Select", "select"),
@@ -1754,7 +1784,14 @@ class MainWindow(QMainWindow):
             ("Erase", "erase"),
             ("Image", "image"),
             ("Text Field", "form-text"),
+            ("Multi-line Text", "form-multiline"),
             ("Checkbox", "form-check"),
+            ("Radio Button", "form-radio"),
+            ("Dropdown", "form-combo"),
+            ("List Box", "form-list"),
+            ("Signature Field", "form-signature"),
+            ("Date Field", "form-date"),
+            ("Push Button", "form-button"),
         ):
             act = make(label, None, checkable=True)
             act.setToolTip(tool_tooltips.get(mode, label))
@@ -1762,12 +1799,16 @@ class MainWindow(QMainWindow):
             self._tool_group.addAction(act)
             act.setData(mode)
             self._tool_actions.append(act)
+            if mode in form_modes:
+                self._form_actions.append(act)
             if mode == "select":
                 act.setChecked(True)
         self._tool_keys = tool_keys
 
         # ---- Menu structure (label, list of actions; None = separator;
         # QMenu = submenu) ----
+        _form_action_set = set(self._form_actions)
+        _insert_actions = [a for a in self._tool_actions if a not in _form_action_set]
         menu_spec: list[tuple[str, list]] = [
             ("&File", [self.act_new, self.act_open, self.recent_menu, None,
                        self.act_save, self.act_save_as, None,
@@ -1776,8 +1817,9 @@ class MainWindow(QMainWindow):
                        self.act_find, self.act_find_next]),
             ("&View", [self.act_prev, self.act_next, None,
                        self.act_zoom_in, self.act_zoom_out, self.act_zoom_reset]),
-            ("&Insert", [*self._tool_actions, None, self.act_page_numbers]),
+            ("&Insert", [*_insert_actions, None, self.act_page_numbers]),
             ("&Pages", [self.act_insert_blank, self.act_rotate, self.act_delete_page]),
+            ("&Forms", [*self._form_actions]),
             ("&Tools", [self.act_watermark]),
         ]
 
@@ -2835,6 +2877,171 @@ class MainWindow(QMainWindow):
         w.rect = fitz.Rect(x0, y0, x1, y1)
         w.field_value = False
         w.border_color = (0.4, 0.4, 0.4)
+        page.add_widget(w)
+        self.view.render_all(preserve_scroll=True)
+        self._mark_dirty()
+
+    def do_form_multiline(self, page_idx: int, x0, y0, x1, y1):
+        if x1 - x0 < 5 or y1 - y0 < 5:
+            return
+        name, ok = QInputDialog.getText(self, "Multi-line Text", "Field name:")
+        if not ok or not name.strip():
+            return
+        self._snapshot()
+        page = self.view.doc[page_idx]
+        w = fitz.Widget()
+        w.field_name = name.strip()
+        w.field_type = fitz.PDF_WIDGET_TYPE_TEXT
+        w.field_flags = fitz.PDF_TX_FIELD_IS_MULTILINE
+        w.rect = fitz.Rect(x0, y0, x1, y1)
+        w.field_value = ""
+        w.text_fontsize = 10
+        w.border_color = (0.4, 0.4, 0.4)
+        w.fill_color = (1, 1, 1)
+        page.add_widget(w)
+        self.view.render_all(preserve_scroll=True)
+        self._mark_dirty()
+
+    def do_form_radio(self, page_idx: int, x0, y0, x1, y1):
+        if x1 - x0 < 5 or y1 - y0 < 5:
+            return
+        side = min(x1 - x0, y1 - y0)
+        x1, y1 = x0 + side, y0 + side
+        group, ok = QInputDialog.getText(
+            self, "Radio Button", "Group name (siblings sharing this name are mutually exclusive):"
+        )
+        if not ok or not group.strip():
+            return
+        export, ok = QInputDialog.getText(
+            self, "Radio Button", "Export value (the on-state for this button):"
+        )
+        if not ok or not export.strip():
+            return
+        self._snapshot()
+        page = self.view.doc[page_idx]
+        w = fitz.Widget()
+        w.field_name = group.strip()
+        w.field_type = fitz.PDF_WIDGET_TYPE_RADIOBUTTON
+        w.rect = fitz.Rect(x0, y0, x1, y1)
+        w.button_caption = export.strip()
+        w.field_value = "Off"
+        w.border_color = (0.4, 0.4, 0.4)
+        page.add_widget(w)
+        self.view.render_all(preserve_scroll=True)
+        self._mark_dirty()
+
+    def _prompt_choices(self, title: str):
+        name, ok = QInputDialog.getText(self, title, "Field name:")
+        if not ok or not name.strip():
+            return None, None
+        raw, ok = QInputDialog.getText(self, title, "Choices (comma-separated):")
+        if not ok:
+            return None, None
+        choices = [c.strip() for c in raw.split(",") if c.strip()]
+        if not choices:
+            return None, None
+        return name.strip(), choices
+
+    def do_form_combo(self, page_idx: int, x0, y0, x1, y1):
+        if x1 - x0 < 5 or y1 - y0 < 5:
+            return
+        name, choices = self._prompt_choices("Dropdown")
+        if name is None:
+            return
+        self._snapshot()
+        page = self.view.doc[page_idx]
+        w = fitz.Widget()
+        w.field_name = name
+        w.field_type = fitz.PDF_WIDGET_TYPE_COMBOBOX
+        w.rect = fitz.Rect(x0, y0, x1, y1)
+        w.choice_values = choices
+        w.field_value = choices[0]
+        w.text_fontsize = max(8, int((y1 - y0) * 0.55))
+        w.border_color = (0.4, 0.4, 0.4)
+        w.fill_color = (1, 1, 1)
+        page.add_widget(w)
+        self.view.render_all(preserve_scroll=True)
+        self._mark_dirty()
+
+    def do_form_list(self, page_idx: int, x0, y0, x1, y1):
+        if x1 - x0 < 5 or y1 - y0 < 5:
+            return
+        name, choices = self._prompt_choices("List Box")
+        if name is None:
+            return
+        self._snapshot()
+        page = self.view.doc[page_idx]
+        w = fitz.Widget()
+        w.field_name = name
+        w.field_type = fitz.PDF_WIDGET_TYPE_LISTBOX
+        w.rect = fitz.Rect(x0, y0, x1, y1)
+        w.choice_values = choices
+        w.field_value = choices[0]
+        w.text_fontsize = 10
+        w.border_color = (0.4, 0.4, 0.4)
+        w.fill_color = (1, 1, 1)
+        page.add_widget(w)
+        self.view.render_all(preserve_scroll=True)
+        self._mark_dirty()
+
+    def do_form_signature(self, page_idx: int, x0, y0, x1, y1):
+        if x1 - x0 < 5 or y1 - y0 < 5:
+            return
+        name, ok = QInputDialog.getText(self, "Signature Field", "Field name:")
+        if not ok or not name.strip():
+            return
+        self._snapshot()
+        page = self.view.doc[page_idx]
+        w = fitz.Widget()
+        w.field_name = name.strip()
+        w.field_type = fitz.PDF_WIDGET_TYPE_SIGNATURE
+        w.rect = fitz.Rect(x0, y0, x1, y1)
+        w.border_color = (0.4, 0.4, 0.4)
+        w.fill_color = (0.96, 0.96, 0.96)
+        page.add_widget(w)
+        self.view.render_all(preserve_scroll=True)
+        self._mark_dirty()
+
+    def do_form_date(self, page_idx: int, x0, y0, x1, y1):
+        if x1 - x0 < 5 or y1 - y0 < 5:
+            return
+        name, ok = QInputDialog.getText(self, "Date Field", "Field name:")
+        if not ok or not name.strip():
+            return
+        self._snapshot()
+        page = self.view.doc[page_idx]
+        w = fitz.Widget()
+        w.field_name = name.strip()
+        w.field_type = fitz.PDF_WIDGET_TYPE_TEXT
+        w.rect = fitz.Rect(x0, y0, x1, y1)
+        w.field_value = ""
+        w.field_label = "Expected format: YYYY-MM-DD"
+        w.text_fontsize = max(8, int((y1 - y0) * 0.55))
+        w.border_color = (0.4, 0.4, 0.4)
+        w.fill_color = (1, 1, 1)
+        page.add_widget(w)
+        self.view.render_all(preserve_scroll=True)
+        self._mark_dirty()
+
+    def do_form_button(self, page_idx: int, x0, y0, x1, y1):
+        if x1 - x0 < 5 or y1 - y0 < 5:
+            return
+        caption, ok = QInputDialog.getText(self, "Push Button", "Button caption:")
+        if not ok or not caption.strip():
+            return
+        name, ok = QInputDialog.getText(self, "Push Button", "Field name:")
+        if not ok or not name.strip():
+            return
+        self._snapshot()
+        page = self.view.doc[page_idx]
+        w = fitz.Widget()
+        w.field_name = name.strip()
+        w.field_type = fitz.PDF_WIDGET_TYPE_BUTTON
+        w.rect = fitz.Rect(x0, y0, x1, y1)
+        w.button_caption = caption.strip()
+        w.text_fontsize = max(8, int((y1 - y0) * 0.55))
+        w.border_color = (0.4, 0.4, 0.4)
+        w.fill_color = (0.9, 0.9, 0.9)
         page.add_widget(w)
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
