@@ -52,6 +52,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QRadioButton,
     QSlider,
@@ -1645,6 +1646,254 @@ class PDFView(QGraphicsView):
 _PDF_FIELD_DISPLAY_HIDDEN = 1  # fitz field_display 0=visible, 1=hidden, 2=no-print, 3=no-view
 
 
+# Acrobat AF* JavaScript helpers (AFNumber_Format / AFDate_FormatEx /
+# AFSpecial_Format) live in Adobe Reader's built-in JS environment. They are
+# the de facto standard for PDF field formatting; non-Acrobat readers may not
+# implement them, in which case the field still saves/displays raw text.
+_FORMAT_SCRIPTS = {
+    "Number": (
+        'AFNumber_Format(2, 0, 0, 0, "$", true);',
+        'AFNumber_Keystroke(2, 0, 0, 0, "$", true);',
+    ),
+    "Date": (
+        'AFDate_FormatEx("mm/dd/yyyy");',
+        'AFDate_KeystrokeEx("mm/dd/yyyy");',
+    ),
+    "Zip":   ("AFSpecial_Format(0);", "AFSpecial_Keystroke(0);"),
+    "Phone": ("AFSpecial_Format(2);", "AFSpecial_Keystroke(2);"),
+    "SSN":   ("AFSpecial_Format(1);", "AFSpecial_Keystroke(1);"),
+}
+
+_CALC_OPS = ["None", "Sum", "Product", "Average", "Minimum", "Maximum"]
+
+
+def _build_calc_script(op: str, sources: list[str]) -> str:
+    """Generate a JS calculation script Adobe Reader executes on field change.
+
+    Result is assigned to widget.script_calc. Empty string for op=None or
+    no sources — the caller writes that back to clear any prior calc.
+    """
+    if op == "None" or not sources:
+        return ""
+    lines = ["var v = 0;"]
+    if op == "Sum":
+        for s in sources:
+            lines.append(f'v += Number(this.getField("{s}").value || 0);')
+        lines.append("event.value = v;")
+    elif op == "Product":
+        lines = ["var v = 1;"]
+        for s in sources:
+            lines.append(f'v *= Number(this.getField("{s}").value || 0);')
+        lines.append("event.value = v;")
+    elif op == "Average":
+        for s in sources:
+            lines.append(f'v += Number(this.getField("{s}").value || 0);')
+        lines.append(f"event.value = v / {len(sources)};")
+    elif op == "Minimum":
+        lines = [f'var v = Number(this.getField("{sources[0]}").value || 0);']
+        for s in sources[1:]:
+            lines.append(
+                f'v = Math.min(v, Number(this.getField("{s}").value || 0));'
+            )
+        lines.append("event.value = v;")
+    elif op == "Maximum":
+        lines = [f'var v = Number(this.getField("{sources[0]}").value || 0);']
+        for s in sources[1:]:
+            lines.append(
+                f'v = Math.max(v, Number(this.getField("{s}").value || 0));'
+            )
+        lines.append("event.value = v;")
+    return "\n".join(lines)
+
+
+def _parse_calc_script(script: str) -> tuple[str, list[str]]:
+    """Reverse of _build_calc_script — returns (op, sources). ('None', []) if
+    nothing recognizable. Used to repopulate the dialog when reopening a
+    field that already has a calc."""
+    if not script:
+        return "None", []
+    refs = re.findall(r'getField\("([^"]+)"\)', script)
+    sources = list(dict.fromkeys(refs))  # preserve order, dedupe
+    if not sources:
+        return "None", []
+    if "Math.min" in script:
+        return "Minimum", sources
+    if "Math.max" in script:
+        return "Maximum", sources
+    if "*=" in script:
+        return "Product", sources
+    if f"/ {len(sources)}" in script:
+        return "Average", sources
+    return "Sum", sources
+
+
+def _collect_text_field_names(doc: "fitz.Document") -> list[str]:
+    """Return all unique TEXT field names across all pages, sorted."""
+    if doc is None:
+        return []
+    seen: list[str] = []
+    s: set[str] = set()
+    for i in range(len(doc)):
+        try:
+            page = doc[i]
+        except Exception:
+            continue
+        for w in page.widgets():
+            if w.field_type != fitz.PDF_WIDGET_TYPE_TEXT:
+                continue
+            name = w.field_name
+            if name and name not in s:
+                s.add(name)
+                seen.append(name)
+    return sorted(seen)
+
+
+def _set_radio_on_state(doc: "fitz.Document", widget_xref: int, on_state: str) -> None:
+    """Rename the /AP/N on-state key for a radio. PyMuPDF ignores
+    button_caption when adding radio widgets — both kids get /Yes by default,
+    which breaks Adobe's mutual-exclusivity (kids in a group must have
+    distinct on-state names per PDF 1.7 §12.7.4.2.3). We rewrite the /AP/N
+    dict in-place by string-substituting the literal '/Yes ' marker.
+    """
+    if not on_state or on_state == "Off":
+        return
+    try:
+        kind, ap = doc.xref_get_key(widget_xref, "AP")
+    except Exception:
+        return
+    if not ap or "/Yes " not in ap:
+        return
+    new_ap = ap.replace("/Yes ", f"/{on_state} ")
+    doc.xref_set_key(widget_xref, "AP", new_ap)
+    doc.xref_set_key(widget_xref, "AS", "/Off")
+
+
+def _link_radio_group(doc: "fitz.Document", group_name: str) -> int | None:
+    """Manually link all radio kids sharing `group_name` under one parent
+    field via /Parent/Kids xref edits. PDF 1.7 §12.7.4.2.3.
+
+    PyMuPDF does NOT auto-link radios sharing field_name — each becomes its
+    own top-level field. To make them mutually exclusive we have to:
+      1. allocate a parent field xref with /T=group_name, /FT=/Btn,
+         /Ff=(1<<15) (Radio bit), /Kids=[...]
+      2. set /Parent on each kid, drop the kid's own /T (inherited)
+      3. point /AcroForm/Fields at the parent (replace the kid entries)
+
+    Returns the new parent xref, or None if fewer than 2 kids match
+    (nothing to group) or doc is missing.
+    """
+    if doc is None or not group_name:
+        return None
+    kid_xrefs: list[int] = []
+    for i in range(len(doc)):
+        try:
+            page = doc[i]
+        except Exception:
+            continue
+        for w in page.widgets():
+            if w.field_type != fitz.PDF_WIDGET_TYPE_RADIOBUTTON:
+                continue
+            if w.field_name == group_name:
+                kid_xrefs.append(w.xref)
+    if len(kid_xrefs) < 2:
+        return None
+    # Was the previous AcroForm/Fields list seeded with these xrefs? Strip.
+    catalog = doc.pdf_catalog()
+    try:
+        kind, af = doc.xref_get_key(catalog, "AcroForm")
+    except Exception:
+        kind, af = ("null", "null")
+    parent_xref = doc.get_new_xref()
+    kid_refs = " ".join(f"{x} 0 R" for x in kid_xrefs)
+    radio_bit = 1 << 15  # PDF spec: /Ff bit 16 = Radio
+    doc.update_object(
+        parent_xref,
+        f"<< /T ({group_name}) /FT /Btn /Ff {radio_bit} "
+        f"/Kids [ {kid_refs} ] /V /Off >>",
+    )
+    for x in kid_xrefs:
+        doc.xref_set_key(x, "Parent", f"{parent_xref} 0 R")
+        doc.xref_set_key(x, "T", "null")
+        doc.xref_set_key(x, "AS", "/Off")
+    # Rewrite /AcroForm/Fields: drop the kid entries, add the parent.
+    # Simplest correct rewrite is to re-derive the full top-level list by
+    # walking pages. Fields with /Parent are NOT top-level.
+    top_level: list[int] = [parent_xref]
+    seen = {parent_xref, *kid_xrefs}
+    for i in range(len(doc)):
+        try:
+            page = doc[i]
+        except Exception:
+            continue
+        for w in page.widgets():
+            if w.xref in seen:
+                continue
+            # Only top-level (no parent) fields go in /AcroForm/Fields.
+            try:
+                ptype, _ = doc.xref_get_key(w.xref, "Parent")
+            except Exception:
+                ptype = "null"
+            if ptype == "null":
+                top_level.append(w.xref)
+                seen.add(w.xref)
+    refs = " ".join(f"{x} 0 R" for x in top_level)
+    doc.xref_set_key(catalog, "AcroForm", f"<< /Fields [ {refs} ] >>")
+    return parent_xref
+
+
+def _all_radio_group_names(doc: "fitz.Document") -> list[str]:
+    """Return unique radio field names in document order."""
+    if doc is None:
+        return []
+    names: list[str] = []
+    s: set[str] = set()
+    for i in range(len(doc)):
+        try:
+            page = doc[i]
+        except Exception:
+            continue
+        for w in page.widgets():
+            if w.field_type != fitz.PDF_WIDGET_TYPE_RADIOBUTTON:
+                continue
+            if w.field_name and w.field_name not in s:
+                s.add(w.field_name)
+                names.append(w.field_name)
+    return names
+
+
+def _radio_export_values(doc: "fitz.Document", group_name: str) -> list[str]:
+    """Existing on-state names for radios in `group_name` — used to enforce
+    uniqueness when adding a new sibling."""
+    if doc is None or not group_name:
+        return []
+    out: list[str] = []
+    for i in range(len(doc)):
+        try:
+            page = doc[i]
+        except Exception:
+            continue
+        for w in page.widgets():
+            if (
+                w.field_type == fitz.PDF_WIDGET_TYPE_RADIOBUTTON
+                and w.field_name == group_name
+            ):
+                cap = w.button_caption or ""
+                # button_caption may be None on reopen; sniff /AP/N keys.
+                if not cap:
+                    try:
+                        ap = doc.xref_get_key(w.xref, "AP")[1]
+                    except Exception:
+                        ap = ""
+                    # /N<</Off ... /Yes ...>> — extract names except Off
+                    for m in re.findall(r"/([A-Za-z0-9_]+)\s", ap):
+                        if m not in ("N", "D", "R", "Off"):
+                            cap = m
+                            break
+                if cap and cap != "Off":
+                    out.append(cap)
+    return out
+
+
 def _color_to_rgb_floats(qc: QColor | None) -> tuple[float, float, float] | None:
     if qc is None or not qc.isValid():
         return None
@@ -1712,9 +1961,10 @@ class FieldPropertiesDialog(QDialog):
     _ALIGN_LABELS = ["Left", "Center", "Right"]
     _FORMAT_LABELS = ["None", "Number", "Date", "Zip", "Phone", "SSN"]
 
-    def __init__(self, widget: "fitz.Widget", parent=None):
+    def __init__(self, widget: "fitz.Widget", parent=None, doc: "fitz.Document | None" = None):
         super().__init__(parent)
         self.widget = widget
+        self.doc = doc  # for populating Calculate source-field picker
         self.setWindowTitle("Field Properties")
         self.setMinimumWidth(440)
 
@@ -1824,6 +2074,8 @@ class FieldPropertiesDialog(QDialog):
         self.choices_list = None
         self.choices_default_combo = None
         self.allow_custom_cb = None
+        self.calc_op_combo = None
+        self.calc_sources_list = None
 
         if ft == fitz.PDF_WIDGET_TYPE_TEXT:
             self.default_value_edit = QLineEdit(self.widget.field_value or "")
@@ -1837,10 +2089,37 @@ class FieldPropertiesDialog(QDialog):
 
             self.format_combo = QComboBox()
             self.format_combo.addItems(self._FORMAT_LABELS)
-            cur = getattr(self.widget, "_pe_format", "None")
+            # Prefer the round-tripped script as source-of-truth; fall back
+            # to the in-memory _pe_format hint for fields created this session.
+            cur = self._infer_format_from_script() or getattr(
+                self.widget, "_pe_format", "None"
+            )
             if cur in self._FORMAT_LABELS:
                 self.format_combo.setCurrentIndex(self._FORMAT_LABELS.index(cur))
             form.addRow("Format:", self.format_combo)
+
+            # Calculate (Adobe folds this into a separate tab; we keep it here.)
+            self.calc_op_combo = QComboBox()
+            self.calc_op_combo.addItems(_CALC_OPS)
+            cur_op, cur_srcs = _parse_calc_script(self.widget.script_calc or "")
+            if cur_op in _CALC_OPS:
+                self.calc_op_combo.setCurrentIndex(_CALC_OPS.index(cur_op))
+            form.addRow("Calculate field as:", self.calc_op_combo)
+
+            layout.addWidget(QLabel("Calculate sources (pick 2+ named text fields):"))
+            self.calc_sources_list = QListWidget()
+            self.calc_sources_list.setSelectionMode(
+                QListWidget.SelectionMode.MultiSelection
+            )
+            self_name = self.widget.field_name or ""
+            for n in _collect_text_field_names(self.doc):
+                if n == self_name:
+                    continue  # never include self
+                item = QListWidgetItem(n)
+                self.calc_sources_list.addItem(item)
+                if n in cur_srcs:
+                    item.setSelected(True)
+            layout.addWidget(self.calc_sources_list)
 
         elif ft == fitz.PDF_WIDGET_TYPE_CHECKBOX:
             self.check_default_combo = QComboBox()
@@ -1906,16 +2185,54 @@ class FieldPropertiesDialog(QDialog):
 
         self.tabs.addTab(page, "Options")
 
-    # --- Actions tab (Phase 3 stub) ---
+    def _infer_format_from_script(self) -> str | None:
+        """Reverse-map widget.script_format back to a Format dropdown label."""
+        s = self.widget.script_format or ""
+        if not s:
+            return None
+        if "AFNumber_Format" in s:
+            return "Number"
+        if "AFDate_Format" in s:
+            return "Date"
+        if "AFSpecial_Format(0)" in s:
+            return "Zip"
+        if "AFSpecial_Format(2)" in s:
+            return "Phone"
+        if "AFSpecial_Format(1)" in s:
+            return "SSN"
+        return None
+
+    # --- Actions tab ---
     def _build_actions_tab(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        msg = QLabel(
-            "Actions and field linking will be configured in the Form Builder panel "
-            "(coming next)."
-        )
-        msg.setWordWrap(True)
-        layout.addWidget(msg)
+        form = QFormLayout()
+        layout.addLayout(form)
+
+        def _editor(initial: str) -> QPlainTextEdit:
+            ed = QPlainTextEdit()
+            ed.setPlainText(initial or "")
+            ed.setMinimumHeight(60)
+            return ed
+
+        self.action_focus_edit = _editor(self.widget.script_focus or "")
+        self.action_blur_edit = _editor(self.widget.script_blur or "")
+        self.action_mouseup_edit = _editor(self.widget.script or "")
+        self.action_calc_edit = _editor(self.widget.script_calc or "")
+        self.action_format_edit = _editor(self.widget.script_format or "")
+        self.action_keystroke_edit = _editor(self.widget.script_change or "")
+
+        form.addRow("On Focus:", self.action_focus_edit)
+        form.addRow("On Blur:", self.action_blur_edit)
+        form.addRow("On Mouse Up:", self.action_mouseup_edit)
+        form.addRow("On Calculate:", self.action_calc_edit)
+        form.addRow("On Format:", self.action_format_edit)
+        form.addRow("On Keystroke:", self.action_keystroke_edit)
+
+        layout.addWidget(QLabel(
+            "Tip: scripts set via the Options tab (Calculate / Format) overwrite "
+            "the matching field above when you press OK."
+        ))
         layout.addStretch()
         self.tabs.addTab(page, "Actions")
 
@@ -1988,6 +2305,16 @@ class FieldPropertiesDialog(QDialog):
             _PDF_FIELD_DISPLAY_HIDDEN if self.hidden_cb.isChecked() else 0
         )
 
+        # Actions tab — written first so Options-tab Format/Calc can overwrite
+        # the matching slots when the user picks a non-"None" option there.
+        if hasattr(self, "action_focus_edit"):
+            w.script_focus = self.action_focus_edit.toPlainText() or ""
+            w.script_blur = self.action_blur_edit.toPlainText() or ""
+            w.script = self.action_mouseup_edit.toPlainText() or ""
+            w.script_calc = self.action_calc_edit.toPlainText() or ""
+            w.script_format = self.action_format_edit.toPlainText() or ""
+            w.script_change = self.action_keystroke_edit.toPlainText() or ""
+
         # Appearance
         bc = self.border_color_btn.color()
         w.border_color = _color_to_rgb_floats(bc)
@@ -2010,7 +2337,24 @@ class FieldPropertiesDialog(QDialog):
             if self.maxlen_spin is not None:
                 w.text_maxlen = self.maxlen_spin.value()
             if self.format_combo is not None:
-                w._pe_format = self.format_combo.currentText()
+                fmt = self.format_combo.currentText()
+                w._pe_format = fmt
+                if fmt in _FORMAT_SCRIPTS:
+                    fs, ks = _FORMAT_SCRIPTS[fmt]
+                    w.script_format = fs
+                    w.script_change = ks
+                else:
+                    # User picked "None" → strip any prior format script.
+                    w.script_format = ""
+                    w.script_change = ""
+            if self.calc_op_combo is not None and self.calc_sources_list is not None:
+                op = self.calc_op_combo.currentText()
+                srcs = [
+                    self.calc_sources_list.item(i).text()
+                    for i in range(self.calc_sources_list.count())
+                    if self.calc_sources_list.item(i).isSelected()
+                ]
+                w.script_calc = _build_calc_script(op, srcs)
         elif ft == fitz.PDF_WIDGET_TYPE_CHECKBOX:
             if self.export_value_edit is not None:
                 w.button_caption = self.export_value_edit.text().strip() or "Yes"
@@ -2034,6 +2378,138 @@ class FieldPropertiesDialog(QDialog):
                     w.field_value = choices[0]
 
         return align_idx
+
+
+class TabOrderDialog(QDialog):
+    """Reorder form-field tab order document-wide.
+
+    Tab order is rewritten by replacing each page's /Annots array with the
+    same widget xrefs in a new order, plus setting /Tabs=/R (row order). PDF
+    1.7 §12.5.3 says viewers may use either /Tabs or /Annots ordering; setting
+    both maximizes the chance Reader/Acrobat respects the new sequence. We
+    verified empirically on PyMuPDF 1.x that /Annots reordering survives
+    save+reopen in `page.widgets()`.
+    """
+
+    def __init__(self, doc: "fitz.Document", parent=None):
+        super().__init__(parent)
+        self.doc = doc
+        self.setWindowTitle("Tab Order")
+        self.setMinimumSize(420, 360)
+
+        self.list_widget = QListWidget()
+        # Each item.data(Qt.UserRole) = (page_idx, xref) so reorder maps cleanly back.
+        self._populate()
+
+        up_btn = QPushButton("Move Up")
+        dn_btn = QPushButton("Move Down")
+        up_btn.clicked.connect(lambda: self._move(-1))
+        dn_btn.clicked.connect(lambda: self._move(1))
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Drag or use the buttons to reorder field tab focus:"))
+        layout.addWidget(self.list_widget)
+        row = QHBoxLayout()
+        row.addWidget(up_btn)
+        row.addWidget(dn_btn)
+        row.addStretch()
+        layout.addLayout(row)
+        layout.addWidget(bb)
+
+        # Enable internal drag-reorder
+        self.list_widget.setDragDropMode(QListWidget.DragDropMode.InternalMove)
+
+    def _populate(self):
+        self.list_widget.clear()
+        if self.doc is None:
+            return
+        for pi in range(len(self.doc)):
+            try:
+                page = self.doc[pi]
+            except Exception:
+                continue
+            for w in page.widgets():
+                label = f"Page {pi + 1}: {w.field_name or '(unnamed)'}"
+                item = QListWidgetItem(label)
+                item.setData(Qt.ItemDataRole.UserRole, (pi, w.xref))
+                self.list_widget.addItem(item)
+
+    def _move(self, delta: int):
+        row = self.list_widget.currentRow()
+        new = row + delta
+        if row < 0 or new < 0 or new >= self.list_widget.count():
+            return
+        item = self.list_widget.takeItem(row)
+        self.list_widget.insertItem(new, item)
+        self.list_widget.setCurrentRow(new)
+
+    def ordered_entries(self) -> list[tuple[int, int]]:
+        """Test hook: current (page_idx, xref) order in the list."""
+        out: list[tuple[int, int]] = []
+        for i in range(self.list_widget.count()):
+            data = self.list_widget.item(i).data(Qt.ItemDataRole.UserRole)
+            if data is not None:
+                out.append(data)
+        return out
+
+    def reorder_to(self, entries: list[tuple[int, int]]) -> None:
+        """Test hook: rewrite the list to a specific order, by xref."""
+        # Snapshot label text BEFORE clear() — clear() deletes the QListWidgetItem
+        # C++ objects out from under any Python refs we still hold.
+        labels: dict[int, str] = {}
+        for i in range(self.list_widget.count()):
+            it = self.list_widget.item(i)
+            data = it.data(Qt.ItemDataRole.UserRole)
+            if data is not None:
+                labels[data[1]] = it.text()
+        self.list_widget.clear()
+        for pi, xr in entries:
+            label = labels.get(xr, f"Page {pi + 1}: xref {xr}")
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, (pi, xr))
+            self.list_widget.addItem(item)
+
+    def apply_to_doc(self) -> None:
+        """Rewrite each page's /Annots in the new order. Non-widget annotations
+        on the page (e.g. highlights) are preserved at the END of /Annots —
+        only widget xrefs are reordered."""
+        if self.doc is None:
+            return
+        # Collect the desired widget order per page from the list.
+        per_page: dict[int, list[int]] = {}
+        for i in range(self.list_widget.count()):
+            data = self.list_widget.item(i).data(Qt.ItemDataRole.UserRole)
+            if data is None:
+                continue
+            pi, xr = data
+            per_page.setdefault(pi, []).append(xr)
+        for pi, widget_xrefs in per_page.items():
+            try:
+                page = self.doc[pi]
+            except Exception:
+                continue
+            current_widget_xrefs = {w.xref for w in page.widgets()}
+            # Read raw /Annots so we can preserve non-widget annot order.
+            try:
+                _, raw = self.doc.xref_get_key(page.xref, "Annots")
+            except Exception:
+                raw = ""
+            existing_order: list[int] = []
+            for m in re.findall(r"(\d+)\s+0\s+R", raw or ""):
+                existing_order.append(int(m))
+            non_widget_tail = [
+                x for x in existing_order if x not in current_widget_xrefs
+            ]
+            new_order = list(widget_xrefs) + non_widget_tail
+            arr = "[ " + " ".join(f"{x} 0 R" for x in new_order) + " ]"
+            self.doc.xref_set_key(page.xref, "Annots", arr)
+            self.doc.xref_set_key(page.xref, "Tabs", "/R")
 
 
 MAX_UNDO = 30
@@ -2159,6 +2635,9 @@ class MainWindow(QMainWindow):
         # Tools (one-shot)
         self.act_watermark = make("Watermark…", self.do_watermark)
 
+        # Forms (one-shot)
+        self.act_tab_order = make("Tab Order…", self.open_tab_order_dialog)
+
         # Open Recent submenu — populated dynamically from QSettings on aboutToShow.
         self.recent_menu = QMenu("Open Recent", self)
         self.recent_menu.aboutToShow.connect(self._populate_recent_menu)
@@ -2279,7 +2758,7 @@ class MainWindow(QMainWindow):
                        self.act_zoom_in, self.act_zoom_out, self.act_zoom_reset]),
             ("&Insert", [*_insert_actions, None, self.act_page_numbers]),
             ("&Pages", [self.act_insert_blank, self.act_rotate, self.act_delete_page]),
-            ("&Forms", [*self._form_actions]),
+            ("&Forms", [*self._form_actions, None, self.act_tab_order]),
             ("&Tools", [self.act_watermark]),
         ]
 
@@ -3372,21 +3851,48 @@ class MainWindow(QMainWindow):
         )
         if not ok or not group.strip():
             return
-        export, ok = QInputDialog.getText(
-            self, "Radio Button", "Export value (the on-state for this button):"
-        )
-        if not ok or not export.strip():
-            return
+        group = group.strip()
+        # Phase 3: enforce unique export-value within an existing group so the
+        # /Parent/Kids linkage gives mutually exclusive on-states.
+        existing_caps = set(_radio_export_values(self.view.doc, group))
+        while True:
+            export, ok = QInputDialog.getText(
+                self, "Radio Button", "Export value (the on-state for this button):"
+            )
+            if not ok or not export.strip():
+                return
+            export = export.strip()
+            if export in existing_caps:
+                QMessageBox.warning(
+                    self,
+                    "Radio Button",
+                    f"'{export}' is already used in group '{group}'. Pick another value.",
+                )
+                continue
+            break
         self._snapshot()
         page = self.view.doc[page_idx]
         w = fitz.Widget()
-        w.field_name = group.strip()
+        w.field_name = group
         w.field_type = fitz.PDF_WIDGET_TYPE_RADIOBUTTON
         w.rect = fitz.Rect(x0, y0, x1, y1)
-        w.button_caption = export.strip()
+        w.button_caption = export
         w.field_value = "Off"
         w.border_color = (0.4, 0.4, 0.4)
         page.add_widget(w)
+        # PyMuPDF hardcodes the on-state to /Yes for new radios — rewrite to
+        # the user's export value so kids in a group have distinct on-states.
+        new_w = list(page.widgets())[-1]
+        try:
+            _set_radio_on_state(self.view.doc, new_w.xref, export)
+        except Exception as exc:
+            print(f"[radio] on-state rename failed: {exc}", file=sys.stderr)
+        # If 2+ radios now share this group, link them under a single parent
+        # so toggling one clears the others (PyMuPDF does NOT auto-link).
+        try:
+            _link_radio_group(self.view.doc, group)
+        except Exception as exc:
+            print(f"[radio] group link failed: {exc}", file=sys.stderr)
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
 
@@ -3529,7 +4035,7 @@ class MainWindow(QMainWindow):
         """Open the FieldPropertiesDialog for `widget` and persist changes on OK."""
         if widget is None or not self.view.doc:
             return
-        dlg = FieldPropertiesDialog(widget, parent=self)
+        dlg = FieldPropertiesDialog(widget, parent=self, doc=self.view.doc)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         self._snapshot()
@@ -3541,8 +4047,53 @@ class MainWindow(QMainWindow):
                 self.view.doc.xref_set_key(widget.xref, "Q", str(int(align_idx)))
             except Exception:
                 pass
+            # Radio: re-run linkage and rewrite on-state name if user changed it.
+            if widget.field_type == fitz.PDF_WIDGET_TYPE_RADIOBUTTON:
+                cap = widget.button_caption or ""
+                if cap and cap != "Off":
+                    try:
+                        _set_radio_on_state(self.view.doc, widget.xref, cap)
+                    except Exception as exc:
+                        print(f"[radio] on-state set failed: {exc}", file=sys.stderr)
+                try:
+                    _link_radio_group(self.view.doc, widget.field_name or "")
+                except Exception as exc:
+                    print(f"[radio] relink failed: {exc}", file=sys.stderr)
         except Exception as exc:
             QMessageBox.warning(self, "Field properties", f"Could not apply: {exc}")
+            if self._undo:
+                self._undo.pop()
+            return
+        self.view.render_all(preserve_scroll=True)
+        self._mark_dirty()
+
+    def collect_all_widgets(self):
+        """Document-wide tab-order source: list of (page_idx, widget) tuples
+        in current /Annots order. Phase 4 (Form Builder side panel) reads
+        from here so the panel stays in sync with TabOrderDialog."""
+        out: list[tuple[int, "fitz.Widget"]] = []
+        if not self.view.doc:
+            return out
+        for pi in range(len(self.view.doc)):
+            try:
+                page = self.view.doc[pi]
+            except Exception:
+                continue
+            for w in page.widgets():
+                out.append((pi, w))
+        return out
+
+    def open_tab_order_dialog(self):
+        if not self.view.doc:
+            return
+        dlg = TabOrderDialog(self.view.doc, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._snapshot()
+        try:
+            dlg.apply_to_doc()
+        except Exception as exc:
+            QMessageBox.warning(self, "Tab order", f"Could not reorder: {exc}")
             if self._undo:
                 self._undo.pop()
             return
