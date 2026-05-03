@@ -48,6 +48,7 @@ from PyQt6.QtWidgets import (
     QGraphicsScene,
     QGraphicsTextItem,
     QGraphicsView,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
@@ -764,6 +765,381 @@ def current_accent_color() -> QColor:
     """Return the active theme's accent color as a QColor (with alpha 220)."""
     c = QColor(_active_palette.get("accent", "#2563EB"))
     return c
+
+
+# Snapshot of stock palette/font constants — captured at import time so the
+# Settings dialog "Reset to defaults" button can restore them after the user
+# has mutated LIGHT_PALETTE / DARK_PALETTE / UI_FONT_PT.
+_DEFAULT_LIGHT_PALETTE: dict[str, str] = dict(LIGHT_PALETTE)
+_DEFAULT_DARK_PALETTE: dict[str, str] = dict(DARK_PALETTE)
+_DEFAULT_UI_FONT_PT = UI_FONT_PT
+
+
+def _shade(hex_color: str, factor: float) -> str:
+    """Lighten (factor>1) or darken (factor<1) a #RRGGBB color."""
+    try:
+        c = QColor(hex_color)
+        if not c.isValid():
+            return hex_color
+        h, s, l, a = c.getHsl()
+        if l < 0:
+            l = c.lightness()
+        new_l = max(0, min(255, int(l * factor)))
+        out = QColor.fromHsl(c.hslHue(), c.hslSaturation(), new_l, a)
+        return out.name()
+    except Exception:
+        return hex_color
+
+
+def _read_auto_open_field_properties() -> bool:
+    try:
+        v = QSettings().value(AUTO_OPEN_FIELD_PROPERTIES_KEY, True)
+    except Exception:
+        return True
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.lower() not in ("false", "0", "no", "")
+    try:
+        return bool(int(v))
+    except Exception:
+        return bool(v)
+
+
+def _load_persisted_appearance() -> None:
+    """Apply UI_FONT_PT and accent overrides saved in QSettings, in-place.
+
+    Called once at app start before the first apply_theme() so a returning
+    user sees the same font size and accent color they last picked.
+    """
+    global UI_FONT_PT
+    try:
+        s = QSettings()
+        sz = s.value("uiFontPt")
+        if sz is not None:
+            try:
+                v = int(sz)
+                if 8 <= v <= 36:
+                    UI_FONT_PT = v
+            except (TypeError, ValueError):
+                pass
+        accent = s.value("accentColor")
+        if isinstance(accent, str) and QColor(accent).isValid():
+            LIGHT_PALETTE["accent"] = accent
+            DARK_PALETTE["accent"] = accent
+            LIGHT_PALETTE["accent-hover"] = _shade(accent, 0.85)
+            DARK_PALETTE["accent-hover"] = _shade(accent, 1.18)
+    except Exception:
+        pass
+
+
+def _read_form_panel_default_visible() -> bool:
+    try:
+        v = QSettings().value(FORM_BUILDER_PANEL_DEFAULT_VISIBLE_KEY, False)
+    except Exception:
+        return False
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.lower() in ("true", "1", "yes")
+    try:
+        return bool(int(v))
+    except Exception:
+        return bool(v)
+
+
+class SettingsDialog(QDialog):
+    """Adobe-Acrobat-style preferences dialog.
+
+    Theme/font/accent changes apply live (no Apply button) — the dialog mutates
+    the module-level palette/font constants and re-applies the QSS so every
+    open widget repaints immediately. Editor + panel settings persist via
+    QSettings and are read back on next launch.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Preferences")
+        self.setModal(True)
+        self.resize(440, 540)
+
+        self._app = QApplication.instance()
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(18, 18, 18, 14)
+        outer.setSpacing(14)
+
+        # ---- Section 1: Appearance --------------------------------------
+        appearance = QGroupBox("Appearance")
+        af = QFormLayout(appearance)
+        af.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        af.setHorizontalSpacing(14)
+        af.setVerticalSpacing(10)
+
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItem("System", "system")
+        self.theme_combo.addItem("Light", "light")
+        self.theme_combo.addItem("Dark", "dark")
+        cur = current_theme_name()
+        for i in range(self.theme_combo.count()):
+            if self.theme_combo.itemData(i) == cur:
+                self.theme_combo.setCurrentIndex(i)
+                break
+        self.theme_combo.currentIndexChanged.connect(self._on_theme_index_changed)
+        af.addRow("Theme:", self.theme_combo)
+
+        font_row = QWidget()
+        fr = QHBoxLayout(font_row)
+        fr.setContentsMargins(0, 0, 0, 0)
+        fr.setSpacing(8)
+        self.font_slider = QSlider(Qt.Orientation.Horizontal)
+        self.font_slider.setRange(10, 18)
+        self.font_slider.setSingleStep(1)
+        self.font_slider.setPageStep(1)
+        self.font_slider.setValue(int(UI_FONT_PT))
+        self.font_spin = QSpinBox()
+        self.font_spin.setRange(10, 18)
+        self.font_spin.setValue(int(UI_FONT_PT))
+        self.font_slider.valueChanged.connect(self._on_font_slider_changed)
+        self.font_spin.valueChanged.connect(self._on_font_spin_changed)
+        fr.addWidget(self.font_slider, 1)
+        fr.addWidget(self.font_spin)
+        af.addRow("UI font size:", font_row)
+
+        self.accent_btn = QPushButton()
+        self.accent_btn.setMinimumHeight(26)
+        self.accent_btn.clicked.connect(self._on_accent_button_clicked)
+        self._refresh_accent_swatch()
+        af.addRow("Accent color:", self.accent_btn)
+
+        self.reset_appearance_btn = QPushButton("Reset to defaults")
+        self.reset_appearance_btn.clicked.connect(self.reset_appearance)
+        af.addRow("", self.reset_appearance_btn)
+
+        outer.addWidget(appearance)
+
+        # ---- Section 2: Editor ------------------------------------------
+        editor = QGroupBox("Editor")
+        ef = QFormLayout(editor)
+        ef.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        ef.setHorizontalSpacing(14)
+        ef.setVerticalSpacing(10)
+
+        self.field_pattern_edit = QLineEdit()
+        self.field_pattern_edit.setPlaceholderText(DEFAULT_FIELD_NAME_PATTERN)
+        try:
+            stored_pat = QSettings().value(
+                DEFAULT_FIELD_NAME_PATTERN_KEY, DEFAULT_FIELD_NAME_PATTERN
+            )
+        except Exception:
+            stored_pat = DEFAULT_FIELD_NAME_PATTERN
+        if isinstance(stored_pat, str):
+            self.field_pattern_edit.setText(stored_pat)
+        self.field_pattern_edit.editingFinished.connect(
+            self._on_field_pattern_changed
+        )
+        ef.addRow("Default field-name pattern:", self.field_pattern_edit)
+
+        self.auto_open_chk = QCheckBox("Auto-open Properties on field create")
+        self.auto_open_chk.setChecked(_read_auto_open_field_properties())
+        self.auto_open_chk.toggled.connect(self._on_auto_open_toggled)
+        ef.addRow("", self.auto_open_chk)
+
+        outer.addWidget(editor)
+
+        # ---- Section 3: Form Builder Panel ------------------------------
+        panel_box = QGroupBox("Form Builder Panel")
+        pf = QFormLayout(panel_box)
+        pf.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        pf.setHorizontalSpacing(14)
+        pf.setVerticalSpacing(10)
+
+        self.show_panel_chk = QCheckBox("Show panel by default for new documents")
+        self.show_panel_chk.setChecked(_read_form_panel_default_visible())
+        self.show_panel_chk.toggled.connect(self._on_show_panel_toggled)
+        pf.addRow("", self.show_panel_chk)
+
+        outer.addWidget(panel_box)
+
+        # ---- Section 4: Advanced ----------------------------------------
+        adv = QGroupBox("Advanced")
+        avf = QVBoxLayout(adv)
+        avf.setContentsMargins(10, 10, 10, 10)
+        self.reset_all_btn = QPushButton("Reset all settings to defaults")
+        self.reset_all_btn.clicked.connect(self._on_reset_all_clicked)
+        avf.addWidget(self.reset_all_btn)
+        outer.addWidget(adv)
+
+        outer.addStretch(1)
+
+        # ---- Close button -----------------------------------------------
+        bottom = QHBoxLayout()
+        bottom.addStretch(1)
+        self.close_btn = QPushButton("Close")
+        self.close_btn.setDefault(True)
+        self.close_btn.clicked.connect(self.accept)
+        bottom.addWidget(self.close_btn)
+        outer.addLayout(bottom)
+
+    # ----- Theme -------------------------------------------------------------
+
+    def _on_theme_index_changed(self, _idx: int) -> None:
+        name = self.theme_combo.currentData()
+        if not isinstance(name, str):
+            return
+        self._on_theme_changed(name)
+
+    def _on_theme_changed(self, name: str) -> None:
+        if name not in THEME_VALID_NAMES:
+            name = "system"
+        set_theme(self._app, name)
+
+    # ----- Font size ---------------------------------------------------------
+
+    def _on_font_slider_changed(self, value: int) -> None:
+        if self.font_spin.value() != value:
+            self.font_spin.blockSignals(True)
+            self.font_spin.setValue(value)
+            self.font_spin.blockSignals(False)
+        self._apply_font_size(value)
+
+    def _on_font_spin_changed(self, value: int) -> None:
+        if self.font_slider.value() != value:
+            self.font_slider.blockSignals(True)
+            self.font_slider.setValue(value)
+            self.font_slider.blockSignals(False)
+        self._apply_font_size(value)
+
+    def _apply_font_size(self, value: int) -> None:
+        global UI_FONT_PT
+        UI_FONT_PT = int(value)
+        try:
+            QSettings().setValue("uiFontPt", int(value))
+        except Exception:
+            pass
+        apply_theme(self._app, current_theme_name())
+
+    # ----- Accent color ------------------------------------------------------
+
+    def _refresh_accent_swatch(self) -> None:
+        accent = LIGHT_PALETTE.get("accent", "#2563EB")
+        self.accent_btn.setText(accent.upper())
+        # Inline style overrides theme QSS for this single button.
+        text_color = "#FFFFFF" if QColor(accent).lightness() < 160 else "#0F172A"
+        self.accent_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {accent}; color: {text_color}; "
+            f"border: 1px solid {accent}; border-radius: 6px; padding: 4px 10px; }}"
+        )
+
+    def _on_accent_button_clicked(self) -> None:
+        start = QColor(LIGHT_PALETTE.get("accent", "#2563EB"))
+        c = QColorDialog.getColor(start, self, "Choose accent color")
+        if c.isValid():
+            self._on_accent_chosen(c)
+
+    def _on_accent_chosen(self, color: QColor) -> None:
+        if not isinstance(color, QColor) or not color.isValid():
+            return
+        hex_name = color.name()
+        LIGHT_PALETTE["accent"] = hex_name
+        DARK_PALETTE["accent"] = hex_name
+        LIGHT_PALETTE["accent-hover"] = _shade(hex_name, 0.85)
+        DARK_PALETTE["accent-hover"] = _shade(hex_name, 1.18)
+        try:
+            QSettings().setValue("accentColor", hex_name)
+        except Exception:
+            pass
+        apply_theme(self._app, current_theme_name())
+        self._refresh_accent_swatch()
+
+    def reset_appearance(self) -> None:
+        global UI_FONT_PT
+        LIGHT_PALETTE.clear()
+        LIGHT_PALETTE.update(_DEFAULT_LIGHT_PALETTE)
+        DARK_PALETTE.clear()
+        DARK_PALETTE.update(_DEFAULT_DARK_PALETTE)
+        UI_FONT_PT = _DEFAULT_UI_FONT_PT
+        try:
+            s = QSettings()
+            s.remove("accentColor")
+            s.remove("uiFontPt")
+        except Exception:
+            pass
+        self.font_slider.blockSignals(True)
+        self.font_spin.blockSignals(True)
+        self.font_slider.setValue(int(UI_FONT_PT))
+        self.font_spin.setValue(int(UI_FONT_PT))
+        self.font_slider.blockSignals(False)
+        self.font_spin.blockSignals(False)
+        apply_theme(self._app, current_theme_name())
+        self._refresh_accent_swatch()
+
+    # ----- Editor section ----------------------------------------------------
+
+    def _on_field_pattern_changed(self) -> None:
+        pat = self.field_pattern_edit.text().strip() or DEFAULT_FIELD_NAME_PATTERN
+        try:
+            QSettings().setValue(DEFAULT_FIELD_NAME_PATTERN_KEY, pat)
+        except Exception:
+            pass
+
+    def _on_auto_open_toggled(self, checked: bool) -> None:
+        try:
+            QSettings().setValue(AUTO_OPEN_FIELD_PROPERTIES_KEY, bool(checked))
+        except Exception:
+            pass
+
+    # ----- Form Builder panel section ---------------------------------------
+
+    def _on_show_panel_toggled(self, checked: bool) -> None:
+        try:
+            QSettings().setValue(
+                FORM_BUILDER_PANEL_DEFAULT_VISIBLE_KEY, bool(checked)
+            )
+        except Exception:
+            pass
+
+    # ----- Reset all ---------------------------------------------------------
+
+    def _on_reset_all_clicked(self) -> None:
+        resp = QMessageBox.question(
+            self,
+            "Reset all settings",
+            "Clear every saved preference and restore defaults?\n\n"
+            "Theme, font size, and accent color will revert immediately. "
+            "Other changes take effect on next launch.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if resp != QMessageBox.StandardButton.Yes:
+            return
+        self.reset_all()
+
+    def reset_all(self) -> None:
+        try:
+            s = QSettings()
+            s.clear()
+        except Exception:
+            pass
+        self.reset_appearance()
+        # Re-sync UI controls in this dialog to defaults.
+        self.field_pattern_edit.blockSignals(True)
+        self.field_pattern_edit.setText(DEFAULT_FIELD_NAME_PATTERN)
+        self.field_pattern_edit.blockSignals(False)
+        self.auto_open_chk.blockSignals(True)
+        self.auto_open_chk.setChecked(True)
+        self.auto_open_chk.blockSignals(False)
+        self.show_panel_chk.blockSignals(True)
+        self.show_panel_chk.setChecked(False)
+        self.show_panel_chk.blockSignals(False)
+        # Snap theme combo back to "System".
+        for i in range(self.theme_combo.count()):
+            if self.theme_combo.itemData(i) == "system":
+                self.theme_combo.blockSignals(True)
+                self.theme_combo.setCurrentIndex(i)
+                self.theme_combo.blockSignals(False)
+                break
+        set_theme(self._app, "system")
 
 
 class WatermarkDialog(QDialog):
@@ -2233,13 +2609,37 @@ def _all_field_names(doc: "fitz.Document") -> set[str]:
     return out
 
 
+DEFAULT_FIELD_NAME_PATTERN = "{type}_{n}"
+DEFAULT_FIELD_NAME_PATTERN_KEY = "defaultFieldNamePattern"
+AUTO_OPEN_FIELD_PROPERTIES_KEY = "autoOpenFieldProperties"
+FORM_BUILDER_PANEL_DEFAULT_VISIBLE_KEY = "formBuilderPanelDefaultVisible"
+
+
 def _unique_field_name(doc: "fitz.Document", base: str) -> str:
-    """Return f'{base}_{n}' for the lowest n>=1 not already used as a field name."""
+    """Return a unique field name based on the user's pattern setting.
+
+    Pattern placeholders: ``{type}`` (the `base` arg, e.g. "Text") and
+    ``{n}`` (the smallest positive integer that yields a name not already
+    in use). Defaults to ``{type}_{n}``.
+    """
+    try:
+        pat = QSettings().value(DEFAULT_FIELD_NAME_PATTERN_KEY, DEFAULT_FIELD_NAME_PATTERN)
+        if not isinstance(pat, str) or not pat.strip():
+            pat = DEFAULT_FIELD_NAME_PATTERN
+    except Exception:
+        pat = DEFAULT_FIELD_NAME_PATTERN
+    if "{n}" not in pat:
+        pat = pat + "_{n}"
     used = _all_field_names(doc)
     n = 1
-    while f"{base}_{n}" in used:
+    while True:
+        try:
+            name = pat.format(type=base, n=n)
+        except Exception:
+            name = f"{base}_{n}"
+        if name not in used:
+            return name
         n += 1
-    return f"{base}_{n}"
 
 
 @contextlib.contextmanager
@@ -3560,6 +3960,8 @@ class MainWindow(QMainWindow):
         self.act_save_as = make("Save As…", self.save_pdf_as, "Ctrl+Shift+S")
         self.act_merge = make("Merge PDF…", self.merge_pdfs)
         self.act_extract = make("Extract Pages…", self.extract_pages_dialog)
+        self.act_preferences = make("Preferences…", self.open_settings_dialog, "Ctrl+,")
+        self.act_preferences.setMenuRole(QAction.MenuRole.PreferencesRole)
 
         # Tools (one-shot)
         self.act_watermark = make("Watermark…", self.do_watermark)
@@ -3682,7 +4084,8 @@ class MainWindow(QMainWindow):
         menu_spec: list[tuple[str, list]] = [
             ("&File", [self.act_new, self.act_open, self.recent_menu, None,
                        self.act_save, self.act_save_as, None,
-                       self.act_merge, self.act_extract]),
+                       self.act_merge, self.act_extract, None,
+                       self.act_preferences]),
             ("&Edit", [self.act_undo, self.act_redo, None,
                        self.act_find, self.act_find_next]),
             ("&View", [self.act_prev, self.act_next, None,
@@ -4220,6 +4623,13 @@ class MainWindow(QMainWindow):
         s = self._recent_settings()
         s.setValue("recent_files", [])
 
+    # --- Preferences ---
+    def open_settings_dialog(self) -> "SettingsDialog":
+        dlg = SettingsDialog(self)
+        self._last_settings_dialog = dlg
+        dlg.exec()
+        return dlg
+
     def _bake_to_clone(self) -> tuple["fitz.Document", list[str]]:
         """Clone the in-memory doc and bake all overlays into the clone.
 
@@ -4708,6 +5118,8 @@ class MainWindow(QMainWindow):
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
         self._refresh_form_panel()
+        if not _read_auto_open_field_properties():
+            return
         try:
             page = self.view.doc[page_idx]
             real = list(page.widgets())[-1]
@@ -5144,7 +5556,7 @@ class MainWindow(QMainWindow):
         # Restore visibility from QSettings (default: hidden until a doc with widgets loads).
         self._form_panel_user_choice: bool | None = self._read_form_panel_visibility()
         if self._form_panel_user_choice is None:
-            self.form_panel.setVisible(False)
+            self.form_panel.setVisible(_read_form_panel_default_visible())
         else:
             self.form_panel.setVisible(self._form_panel_user_choice)
         self.form_panel.visibilityChanged.connect(self._on_form_panel_visibility_changed)
@@ -5387,6 +5799,7 @@ def main():
     QApplication.setApplicationName(APP_NAME)
     app = _PDFApp(sys.argv)
     app.setApplicationDisplayName("Basic PDF Editor")
+    _load_persisted_appearance()
     apply_theme(app, current_theme_name())
     win = MainWindow()
     win.show()
