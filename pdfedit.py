@@ -47,6 +47,8 @@ from PyQt6.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -1463,7 +1465,32 @@ class PDFView(QGraphicsView):
         super().keyReleaseEvent(ev)
 
     # --- mouse ---
+    def _hit_widget(self, ev):
+        """Map a mouse event to (page_idx, widget) if it lands on a form field."""
+        if not self.doc:
+            return None
+        sp = self.mapToScene(ev.pos())
+        loc = self._locate(sp)
+        if loc is None:
+            return None
+        page_idx, px, py = loc
+        widget = self.window_._widget_at(page_idx, px, py)
+        if widget is None:
+            return None
+        return page_idx, widget
+
     def mousePressEvent(self, ev):
+        # Right-click on a form widget (in any mode that lets us see the page) →
+        # contextMenuEvent handles it. Don't start a rubber-band drag here.
+        if (
+            ev.button() == Qt.MouseButton.RightButton
+            and not self._space_pan
+            and self.doc
+        ):
+            hit = self._hit_widget(ev)
+            if hit is not None:
+                ev.accept()
+                return
         if self._space_pan or self.mode == "select" or not self.doc:
             return super().mousePressEvent(ev)
         sp = self.mapToScene(ev.pos())
@@ -1566,6 +1593,43 @@ class PDFView(QGraphicsView):
         elif mode == "form-button":
             self.window_.do_form_button(page, rx0, ry0, rx1, ry1)
 
+    def mouseDoubleClickEvent(self, ev):
+        # Double-click a form field in select mode → open Field Properties.
+        if (
+            self.mode == "select"
+            and not self._space_pan
+            and self.doc
+            and ev.button() == Qt.MouseButton.LeftButton
+        ):
+            hit = self._hit_widget(ev)
+            if hit is not None:
+                page_idx, widget = hit
+                ev.accept()
+                self.window_.edit_widget_properties(page_idx, widget)
+                return
+        super().mouseDoubleClickEvent(ev)
+
+    def contextMenuEvent(self, ev):
+        if not self.doc or self._space_pan:
+            return super().contextMenuEvent(ev)
+        sp = self.mapToScene(ev.pos())
+        loc = self._locate(sp)
+        if loc is None:
+            return super().contextMenuEvent(ev)
+        page_idx, px, py = loc
+        widget = self.window_._widget_at(page_idx, px, py)
+        if widget is None:
+            return super().contextMenuEvent(ev)
+        menu = QMenu(self)
+        edit_act = menu.addAction("Field Properties…")
+        del_act = menu.addAction("Delete Field")
+        chosen = menu.exec(ev.globalPos())
+        if chosen is edit_act:
+            self.window_.edit_widget_properties(page_idx, widget)
+        elif chosen is del_act:
+            self.window_.delete_widget(page_idx, widget)
+        ev.accept()
+
     def wheelEvent(self, ev):
         mods = ev.modifiers()
         if mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier):
@@ -1574,6 +1638,402 @@ class PDFView(QGraphicsView):
             self.render_all(preserve_scroll=True)
         else:
             super().wheelEvent(ev)
+
+
+# PDF /F annotation flag for "Hidden" — bit 2 (value 2). PyMuPDF doesn't expose
+# a PDF_FIELD_DISPLAY_HIDDEN constant, so we use the raw spec value.
+_PDF_FIELD_DISPLAY_HIDDEN = 1  # fitz field_display 0=visible, 1=hidden, 2=no-print, 3=no-view
+
+
+def _color_to_rgb_floats(qc: QColor | None) -> tuple[float, float, float] | None:
+    if qc is None or not qc.isValid():
+        return None
+    return (qc.redF(), qc.greenF(), qc.blueF())
+
+
+def _rgb_floats_to_color(rgb) -> QColor:
+    if not rgb:
+        return QColor(0, 0, 0)
+    try:
+        r, g, b = rgb[0], rgb[1], rgb[2]
+        return QColor.fromRgbF(float(r), float(g), float(b))
+    except Exception:
+        return QColor(0, 0, 0)
+
+
+class _ColorButton(QPushButton):
+    """A small button that shows a color swatch and opens QColorDialog when clicked."""
+
+    def __init__(self, initial: QColor | None, parent=None, allow_none: bool = True):
+        super().__init__(parent)
+        self._color: QColor | None = initial if (initial and initial.isValid()) else None
+        self._allow_none = allow_none
+        self.setMinimumWidth(120)
+        self.clicked.connect(self._pick)
+        self._refresh()
+
+    def color(self) -> QColor | None:
+        return self._color
+
+    def set_color(self, c: QColor | None):
+        self._color = c if (c is not None and c.isValid()) else None
+        self._refresh()
+
+    def _refresh(self):
+        if self._color is None:
+            self.setText("(none)")
+            self.setStyleSheet("")
+        else:
+            name = self._color.name()
+            self.setText(name)
+            # Pick readable contrast for the label.
+            fg = "#000" if self._color.lightnessF() > 0.5 else "#fff"
+            self.setStyleSheet(
+                f"background:{name}; color:{fg}; border:1px solid #888; padding:4px;"
+            )
+
+    def _pick(self):
+        start = self._color if self._color else QColor(255, 255, 255)
+        c = QColorDialog.getColor(start, self, "Pick color")
+        if c.isValid():
+            self.set_color(c)
+
+
+class FieldPropertiesDialog(QDialog):
+    """Adobe-Acrobat-style Field Properties dialog with General/Appearance/Options/Actions tabs."""
+
+    _BORDER_STYLES = [
+        ("Solid", "S"),
+        ("Dashed", "D"),
+        ("Beveled", "B"),
+        ("Inset", "I"),
+        ("Underline", "U"),
+    ]
+    _ALIGN_LABELS = ["Left", "Center", "Right"]
+    _FORMAT_LABELS = ["None", "Number", "Date", "Zip", "Phone", "SSN"]
+
+    def __init__(self, widget: "fitz.Widget", parent=None):
+        super().__init__(parent)
+        self.widget = widget
+        self.setWindowTitle("Field Properties")
+        self.setMinimumWidth(440)
+
+        self.tabs = QTabWidget()
+        self._build_general_tab()
+        self._build_appearance_tab()
+        self._build_options_tab()
+        self._build_actions_tab()
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.tabs)
+        layout.addWidget(bb)
+
+    # --- General tab ---
+    def _build_general_tab(self):
+        page = QWidget()
+        form = QFormLayout(page)
+
+        self.name_edit = QLineEdit(self.widget.field_name or "")
+        form.addRow("Name:", self.name_edit)
+
+        self.tooltip_edit = QLineEdit(self.widget.field_label or "")
+        form.addRow("Tooltip:", self.tooltip_edit)
+
+        flags = int(self.widget.field_flags or 0)
+        self.required_cb = QCheckBox("Required")
+        self.required_cb.setChecked(bool(flags & 2))  # PDF_FIELD_IS_REQUIRED = 1<<1
+        self.readonly_cb = QCheckBox("Read-only")
+        self.readonly_cb.setChecked(bool(flags & 1))  # PDF_FIELD_IS_READ_ONLY = 1<<0
+        self.noexport_cb = QCheckBox("No-export")
+        self.noexport_cb.setChecked(bool(flags & 4))  # PDF_FIELD_IS_NO_EXPORT = 1<<2
+        self.hidden_cb = QCheckBox("Hidden")
+        self.hidden_cb.setChecked(int(self.widget.field_display or 0) == _PDF_FIELD_DISPLAY_HIDDEN)
+
+        form.addRow("Flags:", self.required_cb)
+        form.addRow("", self.readonly_cb)
+        form.addRow("", self.noexport_cb)
+        form.addRow("", self.hidden_cb)
+
+        self.tabs.addTab(page, "General")
+
+    # --- Appearance tab ---
+    def _build_appearance_tab(self):
+        page = QWidget()
+        form = QFormLayout(page)
+
+        self.border_color_btn = _ColorButton(_rgb_floats_to_color(self.widget.border_color))
+        self.fill_color_btn = _ColorButton(_rgb_floats_to_color(self.widget.fill_color))
+        self.text_color_btn = _ColorButton(_rgb_floats_to_color(self.widget.text_color))
+        form.addRow("Border color:", self.border_color_btn)
+        form.addRow("Fill color:", self.fill_color_btn)
+        form.addRow("Text color:", self.text_color_btn)
+
+        self.border_width_spin = QSpinBox()
+        self.border_width_spin.setRange(0, 10)
+        self.border_width_spin.setValue(int(self.widget.border_width or 0))
+        form.addRow("Border width:", self.border_width_spin)
+
+        self.border_style_combo = QComboBox()
+        for label, _code in self._BORDER_STYLES:
+            self.border_style_combo.addItem(label)
+        cur_style = (self.widget.border_style or "S")
+        idx = 0
+        for i, (label, code) in enumerate(self._BORDER_STYLES):
+            # fitz returns the *expanded* name for some styles ("Dashed", "Beveled"...).
+            if cur_style in (code, label, label[0]):
+                idx = i
+                break
+        self.border_style_combo.setCurrentIndex(idx)
+        form.addRow("Border style:", self.border_style_combo)
+
+        self.font_size_spin = QSpinBox()
+        self.font_size_spin.setRange(6, 72)
+        self.font_size_spin.setValue(int(self.widget.text_fontsize or 10))
+        form.addRow("Font size:", self.font_size_spin)
+
+        self.align_combo = QComboBox()
+        self.align_combo.addItems(self._ALIGN_LABELS)
+        self.align_combo.setCurrentIndex(int(getattr(self.widget, "_pe_text_align", 0)))
+        form.addRow("Text alignment:", self.align_combo)
+
+        self.tabs.addTab(page, "Appearance")
+
+    # --- Options tab ---
+    def _build_options_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        form = QFormLayout()
+        layout.addLayout(form)
+
+        ft = self.widget.field_type
+        flags = int(self.widget.field_flags or 0)
+
+        # Containers for type-specific widgets so _apply_to_widget can probe them.
+        self.default_value_edit = None
+        self.maxlen_spin = None
+        self.format_combo = None
+        self.check_default_combo = None
+        self.export_value_edit = None
+        self.group_name_edit = None
+        self.choices_list = None
+        self.choices_default_combo = None
+        self.allow_custom_cb = None
+
+        if ft == fitz.PDF_WIDGET_TYPE_TEXT:
+            self.default_value_edit = QLineEdit(self.widget.field_value or "")
+            form.addRow("Default value:", self.default_value_edit)
+
+            self.maxlen_spin = QSpinBox()
+            self.maxlen_spin.setRange(0, 9999)
+            self.maxlen_spin.setValue(int(self.widget.text_maxlen or 0))
+            self.maxlen_spin.setSpecialValueText("Unlimited")
+            form.addRow("Max length:", self.maxlen_spin)
+
+            self.format_combo = QComboBox()
+            self.format_combo.addItems(self._FORMAT_LABELS)
+            cur = getattr(self.widget, "_pe_format", "None")
+            if cur in self._FORMAT_LABELS:
+                self.format_combo.setCurrentIndex(self._FORMAT_LABELS.index(cur))
+            form.addRow("Format:", self.format_combo)
+
+        elif ft == fitz.PDF_WIDGET_TYPE_CHECKBOX:
+            self.check_default_combo = QComboBox()
+            self.check_default_combo.addItems(["Unchecked", "Checked"])
+            cur = self.widget.field_value
+            checked = bool(cur) and cur not in (False, "Off", "off", 0, "0")
+            self.check_default_combo.setCurrentIndex(1 if checked else 0)
+            form.addRow("Default state:", self.check_default_combo)
+
+            self.export_value_edit = QLineEdit(self.widget.button_caption or "Yes")
+            form.addRow("Export value:", self.export_value_edit)
+
+        elif ft == fitz.PDF_WIDGET_TYPE_RADIOBUTTON:
+            self.group_name_edit = QLineEdit(self.widget.field_name or "")
+            form.addRow("Group name:", self.group_name_edit)
+            self.export_value_edit = QLineEdit(self.widget.button_caption or "")
+            form.addRow("Export value:", self.export_value_edit)
+
+        elif ft in (fitz.PDF_WIDGET_TYPE_COMBOBOX, fitz.PDF_WIDGET_TYPE_LISTBOX):
+            self.choices_list = QListWidget()
+            for v in (self.widget.choice_values or []):
+                # choice_values can be either ["a","b"] or [["export","display"],...]
+                disp = v if isinstance(v, str) else (v[1] if len(v) > 1 else v[0])
+                self.choices_list.addItem(QListWidgetItem(str(disp)))
+            layout.addWidget(QLabel("Choices:"))
+            layout.addWidget(self.choices_list)
+
+            row = QHBoxLayout()
+            add_btn = QPushButton("Add")
+            rm_btn = QPushButton("Remove")
+            up_btn = QPushButton("Up")
+            dn_btn = QPushButton("Down")
+            add_btn.clicked.connect(self._add_choice)
+            rm_btn.clicked.connect(self._remove_choice)
+            up_btn.clicked.connect(lambda: self._move_choice(-1))
+            dn_btn.clicked.connect(lambda: self._move_choice(1))
+            for b in (add_btn, rm_btn, up_btn, dn_btn):
+                row.addWidget(b)
+            row.addStretch()
+            layout.addLayout(row)
+
+            self.choices_default_combo = QComboBox()
+            self._refresh_choices_default()
+            self.choices_list.model().rowsInserted.connect(
+                lambda *a: self._refresh_choices_default()
+            )
+            self.choices_list.model().rowsRemoved.connect(
+                lambda *a: self._refresh_choices_default()
+            )
+            form2 = QFormLayout()
+            form2.addRow("Default:", self.choices_default_combo)
+            layout.addLayout(form2)
+
+            if ft == fitz.PDF_WIDGET_TYPE_COMBOBOX:
+                self.allow_custom_cb = QCheckBox("Allow custom text entry")
+                self.allow_custom_cb.setChecked(bool(flags & fitz.PDF_CH_FIELD_IS_EDIT))
+                layout.addWidget(self.allow_custom_cb)
+
+        else:
+            # Signature / Button — no per-type options in Phase 2.
+            layout.addWidget(QLabel("This field type has no editable options."))
+            layout.addStretch()
+
+        self.tabs.addTab(page, "Options")
+
+    # --- Actions tab (Phase 3 stub) ---
+    def _build_actions_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        msg = QLabel(
+            "Actions and field linking will be configured in the Form Builder panel "
+            "(coming next)."
+        )
+        msg.setWordWrap(True)
+        layout.addWidget(msg)
+        layout.addStretch()
+        self.tabs.addTab(page, "Actions")
+
+    # --- choices helpers ---
+    def _add_choice(self):
+        text, ok = QInputDialog.getText(self, "Add choice", "Choice value:")
+        if ok and text.strip():
+            self.choices_list.addItem(QListWidgetItem(text.strip()))
+
+    def _remove_choice(self):
+        row = self.choices_list.currentRow()
+        if row >= 0:
+            self.choices_list.takeItem(row)
+
+    def _move_choice(self, delta: int):
+        row = self.choices_list.currentRow()
+        new = row + delta
+        if row < 0 or new < 0 or new >= self.choices_list.count():
+            return
+        item = self.choices_list.takeItem(row)
+        self.choices_list.insertItem(new, item)
+        self.choices_list.setCurrentRow(new)
+
+    def _refresh_choices_default(self):
+        if self.choices_default_combo is None or self.choices_list is None:
+            return
+        cur_text = self.choices_default_combo.currentText()
+        self.choices_default_combo.clear()
+        for i in range(self.choices_list.count()):
+            self.choices_default_combo.addItem(self.choices_list.item(i).text())
+        if cur_text:
+            idx = self.choices_default_combo.findText(cur_text)
+            if idx >= 0:
+                self.choices_default_combo.setCurrentIndex(idx)
+
+    def choice_values(self) -> list[str]:
+        if self.choices_list is None:
+            return []
+        return [self.choices_list.item(i).text() for i in range(self.choices_list.count())]
+
+    def add_choice_value(self, value: str):
+        """Test hook: append a choice without going through QInputDialog."""
+        if self.choices_list is not None:
+            self.choices_list.addItem(QListWidgetItem(str(value)))
+
+    # --- apply ---
+    def _apply_to_widget(self) -> int:
+        """Push form values back onto self.widget. Returns the new /Q (0/1/2) value
+        so the caller can persist it via xref_set_key — fitz.Widget has no
+        text_align attribute, so /Q lives outside the in-place mutation."""
+        w = self.widget
+
+        new_name = self.name_edit.text().strip()
+        if new_name:
+            w.field_name = new_name
+        w.field_label = self.tooltip_edit.text().strip() or None
+
+        flags = int(w.field_flags or 0)
+        flags = (flags | 2) if self.required_cb.isChecked() else (flags & ~2)
+        flags = (flags | 1) if self.readonly_cb.isChecked() else (flags & ~1)
+        flags = (flags | 4) if self.noexport_cb.isChecked() else (flags & ~4)
+
+        ft = w.field_type
+        if ft == fitz.PDF_WIDGET_TYPE_COMBOBOX and self.allow_custom_cb is not None:
+            edit_bit = fitz.PDF_CH_FIELD_IS_EDIT
+            flags = (flags | edit_bit) if self.allow_custom_cb.isChecked() else (flags & ~edit_bit)
+        w.field_flags = flags
+
+        w.field_display = (
+            _PDF_FIELD_DISPLAY_HIDDEN if self.hidden_cb.isChecked() else 0
+        )
+
+        # Appearance
+        bc = self.border_color_btn.color()
+        w.border_color = _color_to_rgb_floats(bc)
+        fc = self.fill_color_btn.color()
+        w.fill_color = _color_to_rgb_floats(fc)
+        tc = self.text_color_btn.color()
+        if tc is not None:
+            w.text_color = _color_to_rgb_floats(tc)
+        w.border_width = self.border_width_spin.value()
+        w.border_style = self._BORDER_STYLES[self.border_style_combo.currentIndex()][1]
+        w.text_fontsize = self.font_size_spin.value()
+        align_idx = self.align_combo.currentIndex()
+        # Stash for round-trip in dialog state; persisted via /Q by the caller.
+        w._pe_text_align = align_idx
+
+        # Options (per type)
+        if ft == fitz.PDF_WIDGET_TYPE_TEXT:
+            if self.default_value_edit is not None:
+                w.field_value = self.default_value_edit.text()
+            if self.maxlen_spin is not None:
+                w.text_maxlen = self.maxlen_spin.value()
+            if self.format_combo is not None:
+                w._pe_format = self.format_combo.currentText()
+        elif ft == fitz.PDF_WIDGET_TYPE_CHECKBOX:
+            if self.export_value_edit is not None:
+                w.button_caption = self.export_value_edit.text().strip() or "Yes"
+            if self.check_default_combo is not None:
+                w.field_value = self.check_default_combo.currentIndex() == 1
+        elif ft == fitz.PDF_WIDGET_TYPE_RADIOBUTTON:
+            if self.group_name_edit is not None:
+                grp = self.group_name_edit.text().strip()
+                if grp:
+                    w.field_name = grp
+            if self.export_value_edit is not None:
+                w.button_caption = self.export_value_edit.text().strip() or "On"
+        elif ft in (fitz.PDF_WIDGET_TYPE_COMBOBOX, fitz.PDF_WIDGET_TYPE_LISTBOX):
+            choices = self.choice_values()
+            w.choice_values = choices
+            if self.choices_default_combo is not None:
+                d = self.choices_default_combo.currentText()
+                if d:
+                    w.field_value = d
+                elif choices:
+                    w.field_value = choices[0]
+
+        return align_idx
 
 
 MAX_UNDO = 30
@@ -3043,6 +3503,67 @@ class MainWindow(QMainWindow):
         w.border_color = (0.4, 0.4, 0.4)
         w.fill_color = (0.9, 0.9, 0.9)
         page.add_widget(w)
+        self.view.render_all(preserve_scroll=True)
+        self._mark_dirty()
+
+    # --- Form field editing (Phase 2) ---
+    def _widget_at(self, page_idx: int, pdf_x: float, pdf_y: float):
+        """Return the topmost form widget under (pdf_x, pdf_y) on page_idx, or None."""
+        if not self.view.doc or page_idx < 0 or page_idx >= len(self.view.doc):
+            return None
+        try:
+            page = self.view.doc[page_idx]
+        except Exception:
+            return None
+        hit = None
+        pt = fitz.Point(pdf_x, pdf_y)
+        for w in page.widgets():
+            try:
+                if w.rect.contains(pt):
+                    hit = w  # last match wins (topmost in z-order)
+            except Exception:
+                continue
+        return hit
+
+    def edit_widget_properties(self, page_idx: int, widget):
+        """Open the FieldPropertiesDialog for `widget` and persist changes on OK."""
+        if widget is None or not self.view.doc:
+            return
+        dlg = FieldPropertiesDialog(widget, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._snapshot()
+        try:
+            align_idx = dlg._apply_to_widget()
+            widget.update()
+            try:
+                # /Q (text alignment) lives outside fitz.Widget — write it directly.
+                self.view.doc.xref_set_key(widget.xref, "Q", str(int(align_idx)))
+            except Exception:
+                pass
+        except Exception as exc:
+            QMessageBox.warning(self, "Field properties", f"Could not apply: {exc}")
+            if self._undo:
+                self._undo.pop()
+            return
+        self.view.render_all(preserve_scroll=True)
+        self._mark_dirty()
+
+    def delete_widget(self, page_idx: int, widget):
+        """Remove `widget` from page `page_idx` (with snapshot + render)."""
+        if widget is None or not self.view.doc:
+            return
+        if page_idx < 0 or page_idx >= len(self.view.doc):
+            return
+        page = self.view.doc[page_idx]
+        self._snapshot()
+        try:
+            page.delete_widget(widget)
+        except Exception as exc:
+            QMessageBox.warning(self, "Delete field", f"Could not delete: {exc}")
+            if self._undo:
+                self._undo.pop()
+            return
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
 
