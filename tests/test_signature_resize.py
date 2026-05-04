@@ -218,10 +218,10 @@ def test_bake_failure_label_uses_display_name_for_text_box(
 
     seen: dict[str, str] = {}
 
-    def fake_warning(parent, title, body, *a, **kw):
+    def fake_critical(parent, title, body, *a, **kw):
         seen["body"] = body
 
-    monkeypatch.setattr(pdfedit.QMessageBox, "warning", staticmethod(fake_warning))
+    monkeypatch.setattr(pdfedit.QMessageBox, "critical", staticmethod(fake_critical))
 
     out = tmp_path / "label.pdf"
     win.path = str(out)
@@ -248,10 +248,10 @@ def test_bake_failure_label_uses_display_name_for_signature(
 
     seen: dict[str, str] = {}
 
-    def fake_warning(parent, title, body, *a, **kw):
+    def fake_critical(parent, title, body, *a, **kw):
         seen["body"] = body
 
-    monkeypatch.setattr(pdfedit.QMessageBox, "warning", staticmethod(fake_warning))
+    monkeypatch.setattr(pdfedit.QMessageBox, "critical", staticmethod(fake_critical))
 
     out = tmp_path / "label2.pdf"
     win.path = str(out)

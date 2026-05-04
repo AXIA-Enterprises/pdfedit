@@ -2650,13 +2650,29 @@ class PDFView(QGraphicsView):
         # Search highlights belong to the scene that's about to be cleared too.
         self._search_items = []
 
-    def load(self, path: str):
+    def load(self, path: str) -> bool:
         self.clear_overlays()
         if self.doc:
             self.doc.close()
-        self.doc = fitz.open(path)
+            self.doc = None
+        doc = fitz.open(path)
+        if doc.needs_pass:
+            pwd, ok = QInputDialog.getText(
+                self, "Password required",
+                f"Enter password for {os.path.basename(path)}:",
+                QLineEdit.EchoMode.Password,
+            )
+            if not ok or not doc.authenticate(pwd):
+                doc.close()
+                QMessageBox.warning(
+                    self, "Cannot open",
+                    "Wrong password — file not opened.",
+                )
+                return False
+        self.doc = doc
         self.page_idx = 0
         self.render_all()
+        return True
 
     def page_count(self) -> int:
         return len(self.doc) if self.doc else 0
@@ -5149,13 +5165,48 @@ class MainWindow(QMainWindow):
         ev.ignore()
 
     def dropEvent(self, ev):
-        for u in ev.mimeData().urls():
-            p = u.toLocalFile()
-            if p.lower().endswith(".pdf"):
-                if self._confirm_discard_changes():
-                    self.open_path(p)
-                ev.acceptProposedAction()
+        pdf_paths = [
+            u.toLocalFile() for u in ev.mimeData().urls()
+            if u.toLocalFile().lower().endswith(".pdf")
+        ]
+        if not pdf_paths:
+            return
+        if len(pdf_paths) == 1:
+            if not self._confirm_discard_changes():
                 return
+            self.open_path(pdf_paths[0])
+            ev.acceptProposedAction()
+            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Multiple PDFs dropped")
+        box.setText(f"You dropped {len(pdf_paths)} PDFs. What would you like to do?")
+        first_btn = box.addButton(
+            "Open first file only", QMessageBox.ButtonRole.AcceptRole
+        )
+        merge_btn = box.addButton(
+            "Merge all", QMessageBox.ButtonRole.AcceptRole
+        )
+        cancel_btn = box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(first_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is cancel_btn or clicked is None:
+            return
+        if clicked is first_btn:
+            if not self._confirm_discard_changes():
+                return
+            self.open_path(pdf_paths[0])
+            ev.acceptProposedAction()
+            return
+        if clicked is merge_btn:
+            if not self._confirm_discard_changes():
+                return
+            self.open_path(pdf_paths[0])
+            if self.view.doc is not None:
+                self.merge_pdfs(paths=pdf_paths[1:])
+            ev.acceptProposedAction()
+            return
 
     # --- Close warning ---
     def closeEvent(self, ev):
@@ -5246,9 +5297,23 @@ class MainWindow(QMainWindow):
 
     def open_path(self, path: str):
         try:
-            self.view.load(path)
+            ok = self.view.load(path)
         except Exception as exc:
-            QMessageBox.critical(self, "Error", f"Could not open PDF:\n{exc}")
+            msg = str(exc)
+            is_corrupt = isinstance(exc, getattr(fitz, "FileDataError", ())) or \
+                "cannot open broken document" in msg.lower() or \
+                "no objects found" in msg.lower()
+            if is_corrupt:
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Icon.Critical)
+                box.setWindowTitle("Cannot open PDF")
+                box.setText("This PDF appears to be corrupted or unreadable.")
+                box.setDetailedText(msg)
+                box.exec()
+            else:
+                QMessageBox.critical(self, "Error", f"Could not open PDF:\n{msg}")
+            return
+        if not ok:
             return
         self.path = path
         self._undo.clear()
@@ -5269,6 +5334,23 @@ class MainWindow(QMainWindow):
         # No-arg QSettings uses the org/app set on QApplication in main().
         return QSettings()
 
+    @staticmethod
+    def _recent_key(path: str) -> str:
+        """Normalize a path for case-insensitive / symlink-resolved comparison.
+
+        normcase is a no-op on POSIX, but macOS's HFS+/APFS-default volumes
+        are case-insensitive — so we lower-case on darwin to dedup
+        /Users/x/A.pdf and /Users/x/a.pdf to one entry.
+        """
+        try:
+            resolved = os.path.realpath(path)
+        except Exception:
+            resolved = path
+        normalized = os.path.normcase(resolved)
+        if sys.platform == "darwin":
+            normalized = normalized.lower()
+        return normalized
+
     def _add_recent(self, path: str) -> None:
         if not path:
             return
@@ -5280,8 +5362,9 @@ class MainWindow(QMainWindow):
         existing = s.value("recent_files", []) or []
         if isinstance(existing, str):
             existing = [existing]
-        # Remove any existing entry for this path (case-insensitive on macOS).
-        filtered = [p for p in existing if p and p != abspath]
+        new_key = self._recent_key(abspath)
+        # Remove any existing entry whose normalized form matches.
+        filtered = [p for p in existing if p and self._recent_key(p) != new_key]
         filtered.insert(0, abspath)
         filtered = filtered[: self._RECENT_MAX]
         s.setValue("recent_files", filtered)
@@ -5331,6 +5414,11 @@ class MainWindow(QMainWindow):
     def _clear_recent(self) -> None:
         s = self._recent_settings()
         s.setValue("recent_files", [])
+        # Refresh the visible submenu immediately so the user sees feedback
+        # instead of waiting for the next aboutToShow.
+        self.recent_menu.clear()
+        empty = self.recent_menu.addAction("(No recent files)")
+        empty.setEnabled(False)
 
     # --- Preferences ---
     def open_settings_dialog(self) -> "SettingsDialog":
@@ -5363,10 +5451,19 @@ class MainWindow(QMainWindow):
                 print(f"[bake] overlay failed: {exc}", file=sys.stderr)
         return clone, failed
 
-    def _report_bake_failures(self, failed: list[str]) -> None:
+    def _report_bake_failures(self, failed: list[str], *, critical: bool = False) -> None:
         if not failed:
             return
         body = "\n".join(f"  • {f}" for f in failed)
+        if critical:
+            QMessageBox.critical(
+                self,
+                "Save aborted",
+                f"All {len(failed)} overlay(s) failed to embed; save was "
+                "aborted to avoid losing your edits:\n\n"
+                f"{body}",
+            )
+            return
         QMessageBox.warning(
             self,
             "Some overlays could not be embedded",
@@ -5384,8 +5481,17 @@ class MainWindow(QMainWindow):
         """
         tmp = path + ".tmp"
         clone = None
+        failed: list[str] = []
+        overlay_count = len(self.view.overlays)
         try:
             clone, failed = self._bake_to_clone()
+            if overlay_count > 0 and len(failed) == overlay_count:
+                # Every overlay failed to bake — refuse the save so the
+                # caller doesn't mark a stale file clean.
+                clone.close()
+                clone = None
+                self._report_bake_failures(failed, critical=True)
+                return False
             clone.save(tmp, garbage=4, deflate=True)
             clone.close()
             clone = None
@@ -5406,9 +5512,9 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         if failed:
-            # The file IS on disk — bake failures are warnings, not save
-            # failures. Surface them, but still return True so callers mark
-            # the document clean and update self.path.
+            # The file IS on disk — partial bake failures are warnings, not
+            # save failures. Surface them, but still return True so callers
+            # mark the document clean and update self.path.
             self._report_bake_failures(failed)
         return True
 
@@ -5575,6 +5681,8 @@ class MainWindow(QMainWindow):
             return
         self._snapshot()
         total = len(self.view.doc)
+        applied = 0
+        failures: list[str] = []
         for i in range(total):
             page = self.view.doc[i]
             text = f"Page {i + 1} of {total}"
@@ -5584,12 +5692,25 @@ class MainWindow(QMainWindow):
                 tw = len(text) * 6.0
             x = (page.rect.width - tw) / 2
             y = page.rect.height - 24
-            page.insert_text(
-                (x, y), text, fontname="tiro", fontsize=12, color=(0, 0, 0)
-            )
+            try:
+                page.insert_text(
+                    (x, y), text, fontname="tiro", fontsize=12, color=(0, 0, 0)
+                )
+                applied += 1
+            except Exception as exc:
+                failures.append(f"page {i + 1}: {exc}")
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
-        self.statusBar().showMessage(f"Added page numbers to {total} pages")
+        if failures:
+            body = "\n".join(f"  • {f}" for f in failures)
+            QMessageBox.warning(
+                self, "Page numbers",
+                f"Page numbers added to {applied} of {total} pages.\n\n"
+                f"{len(failures)} page(s) failed:\n\n{body}",
+            )
+        self.statusBar().showMessage(
+            f"Added page numbers to {applied} of {total} pages"
+        )
 
     def _resolve_pdf_font(self, family: str, page) -> str:
         """Pick a PyMuPDF fontname for `family`, registering fonts as needed.
@@ -5653,6 +5774,7 @@ class MainWindow(QMainWindow):
 
         self._snapshot()
         applied = 0
+        failures: list[str] = []
         for i in indices:
             page = self.view.doc[i]
             fontname = self._resolve_pdf_font(family, page)
@@ -5673,22 +5795,30 @@ class MainWindow(QMainWindow):
                 )
                 applied += 1
             except Exception as exc:
-                print(f"[watermark] page {i + 1}: {exc}", file=sys.stderr)
+                failures.append(f"page {i + 1}: {exc}")
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
+        if failures:
+            body = "\n".join(f"  • {f}" for f in failures)
+            QMessageBox.warning(
+                self, "Watermark",
+                f"Watermark applied to {applied} page(s).\n\n"
+                f"{len(failures)} page(s) failed:\n\n{body}",
+            )
         self.statusBar().showMessage(
             f"Applied watermark to {applied} page(s)"
         )
 
-    def merge_pdfs(self):
+    def merge_pdfs(self, _checked=False, *, paths: list[str] | None = None):
         if not self.view.doc:
             QMessageBox.information(
                 self, "Merge PDF", "Open or create a PDF first to merge into."
             )
             return
-        paths, _ = QFileDialog.getOpenFileNames(
-            self, "Merge PDFs (append to current)", "", "PDF Files (*.pdf)"
-        )
+        if paths is None:
+            paths, _ = QFileDialog.getOpenFileNames(
+                self, "Merge PDFs (append to current)", "", "PDF Files (*.pdf)"
+            )
         if not paths:
             return
         self._snapshot()
@@ -5696,11 +5826,31 @@ class MainWindow(QMainWindow):
         errors: list[str] = []
         for p in paths:
             try:
-                with fitz.open(p) as src:
-                    self.view.doc.insert_pdf(src)
+                src = fitz.open(p)
+            except Exception as exc:
+                errors.append(f"{os.path.basename(p)}: {exc}")
+                continue
+            try:
+                if src.needs_pass:
+                    pwd, ok = QInputDialog.getText(
+                        self, "Password required",
+                        f"Enter password for {os.path.basename(p)}:",
+                        QLineEdit.EchoMode.Password,
+                    )
+                    if not ok or not src.authenticate(pwd):
+                        errors.append(
+                            f"{os.path.basename(p)}: wrong password — skipped"
+                        )
+                        continue
+                self.view.doc.insert_pdf(src)
                 appended += 1
             except Exception as exc:
                 errors.append(f"{os.path.basename(p)}: {exc}")
+            finally:
+                try:
+                    src.close()
+                except Exception:
+                    pass
         self.view.render_all(preserve_scroll=True)
         self._refresh_page_label()
         self._mark_dirty()
@@ -5739,10 +5889,11 @@ class MainWindow(QMainWindow):
         if not out.lower().endswith(".pdf"):
             out += ".pdf"
         tmp = out + ".tmp"
+        baked, failed = self._bake_to_clone()
         new_doc = fitz.open()
         try:
             for i in indices:
-                new_doc.insert_pdf(self.view.doc, from_page=i, to_page=i)
+                new_doc.insert_pdf(baked, from_page=i, to_page=i)
             new_doc.save(tmp, garbage=4, deflate=True)
             new_doc.close()
             os.replace(tmp, out)
@@ -5758,6 +5909,13 @@ class MainWindow(QMainWindow):
                 pass
             QMessageBox.critical(self, "Extract Pages failed", str(exc))
             return
+        finally:
+            try:
+                baked.close()
+            except Exception:
+                pass
+        if failed:
+            self._report_bake_failures(failed)
         self.statusBar().showMessage(
             f"Extracted {len(indices)} page(s) to {out}"
         )
