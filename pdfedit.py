@@ -79,6 +79,7 @@ from PyQt6.QtWidgets import (
     QProgressDialog,
     QPushButton,
     QRadioButton,
+    QSizePolicy,
     QSlider,
     QSpinBox,
     QStackedWidget,
@@ -6386,16 +6387,12 @@ class PageThumbnailsPanel(QDockWidget):
 
         body = QWidget(self)
         layout = QVBoxLayout(body)
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(4)
+        layout.setContentsMargins(4, 2, 4, 4)
+        layout.setSpacing(2)
 
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
-        title = QLabel("Page Thumbnails")
-        f = title.font()
-        f.setBold(True)
-        title.setFont(f)
-        header.addWidget(title)
+        header.setSpacing(0)
         header.addStretch()
         self.refresh_btn = QToolButton(body)
         self.refresh_btn.setText("Refresh")
@@ -6853,16 +6850,12 @@ class FormBuilderPanel(QDockWidget):
 
         body = QWidget(self)
         layout = QVBoxLayout(body)
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(4)
+        layout.setContentsMargins(4, 2, 4, 4)
+        layout.setSpacing(2)
 
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
-        title = QLabel("Form Fields")
-        f = title.font()
-        f.setBold(True)
-        title.setFont(f)
-        header.addWidget(title)
+        header.setSpacing(0)
         header.addStretch()
         self.refresh_btn = QToolButton(body)
         self.refresh_btn.setText("Refresh")
@@ -7467,6 +7460,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Basic PDF Editor")
         self.resize(1100, 850)
+        self.setMinimumWidth(700)
         self.setAcceptDrops(True)
 
         self.tabs = QTabWidget(self)
@@ -7985,9 +7979,14 @@ class MainWindow(QMainWindow):
         self.in_app_menubar = QToolBar("Menus")
         self.in_app_menubar.setObjectName("InAppMenuBar")
         self.in_app_menubar.setMovable(False)
+        self.in_app_menubar.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed
+        )
         tb = QToolBar("Main")
         tb.setObjectName("MainToolBar")
         tb.setMovable(False)
+        tb.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self.tb = tb
         # Stack: menu strip on top, tool toolbar below.
         self.addToolBar(self.in_app_menubar)
         self.addToolBarBreak()
@@ -7999,6 +7998,7 @@ class MainWindow(QMainWindow):
         self.page_spin.setRange(1, 1)
         self.page_spin.setValue(1)
         self.page_spin.setFixedWidth(70)
+        self.page_spin.setMaximumWidth(70)
         self.page_spin.setKeyboardTracking(False)
         # editingFinished fires on Enter/blur; valueChanged would fire on every
         # up/down click during typing, scattering scroll mid-edit.
@@ -8022,6 +8022,10 @@ class MainWindow(QMainWindow):
         self.find_box = QLineEdit()
         self.find_box.setPlaceholderText("Find…")
         self.find_box.setFixedWidth(180)
+        self.find_box.setMaximumWidth(220)
+        self.find_box.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
         self.find_box.returnPressed.connect(self.find_next)
         tb.addWidget(self.find_box)
         self.find_case_chk = QCheckBox("Match case")
@@ -8039,6 +8043,7 @@ class MainWindow(QMainWindow):
         fmt = QToolBar("Format")
         fmt.setObjectName("FormatToolBar")
         fmt.setMovable(False)
+        fmt.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self.addToolBarBreak()
         self.addToolBar(fmt)
         self.fmt_toolbar = fmt
@@ -8055,6 +8060,10 @@ class MainWindow(QMainWindow):
         self.fmt_family.addItems(POPULAR_FONTS)
         self.fmt_family.setCurrentText("Helvetica")
         self.fmt_family.setMinimumContentsLength(14)
+        self.fmt_family.setMaximumWidth(180)
+        self.fmt_family.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
         self.fmt_family.activated.connect(self._fmt_change_family)
         fmt.addWidget(self.fmt_family)
 
@@ -8063,6 +8072,10 @@ class MainWindow(QMainWindow):
         self.fmt_size = QSpinBox()
         self.fmt_size.setRange(4, 288)
         self.fmt_size.setValue(14)
+        self.fmt_size.setMaximumWidth(60)
+        self.fmt_size.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
         self.fmt_size.editingFinished.connect(
             lambda: self._fmt_change_size_value(self.fmt_size.value())
         )
@@ -10859,6 +10872,32 @@ class MainWindow(QMainWindow):
             self.form_panel.setVisible(self._form_panel_user_choice)
         self.form_panel.visibilityChanged.connect(self._on_form_panel_visibility_changed)
 
+        tb = getattr(self, "tb", None)
+        if tb is not None:
+            btn = QToolButton(tb)
+            btn.setObjectName("ToggleFormPanelButton")
+            btn.setText("Fields")
+            btn.setToolTip("Show / hide the Form Fields panel")
+            btn.setAutoRaise(True)
+            btn.setCheckable(True)
+            btn.setChecked(self.form_panel.isVisible())
+            btn.clicked.connect(self.act_show_form_panel.trigger)
+            self.act_show_form_panel.toggled.connect(btn.setChecked)
+            self.form_toggle_btn = btn
+            anchor = None
+            for act in tb.actions():
+                w = tb.widgetForAction(act)
+                if isinstance(w, QToolButton) and w.objectName() == "ToggleThumbsPanelButton":
+                    idx = tb.actions().index(act)
+                    siblings = tb.actions()
+                    if idx + 1 < len(siblings):
+                        anchor = siblings[idx + 1]
+                    break
+            if anchor is not None:
+                tb.insertWidget(anchor, btn)
+            else:
+                tb.addWidget(btn)
+
     def _read_form_panel_visibility(self) -> bool | None:
         try:
             s = QSettings()
@@ -10924,6 +10963,27 @@ class MainWindow(QMainWindow):
         else:
             self.thumbs_panel.setVisible(self._thumbs_panel_user_choice)
         self.thumbs_panel.visibilityChanged.connect(self._on_thumbs_panel_visibility_changed)
+
+        tb = getattr(self, "tb", None)
+        if tb is not None:
+            btn = QToolButton(tb)
+            btn.setObjectName("ToggleThumbsPanelButton")
+            btn.setText("Pages")
+            btn.setToolTip("Show / hide the Page Thumbnails panel")
+            btn.setAutoRaise(True)
+            btn.setCheckable(True)
+            btn.setChecked(self.thumbs_panel.isVisible())
+            btn.clicked.connect(self.act_show_thumbs_panel.trigger)
+            self.act_show_thumbs_panel.toggled.connect(btn.setChecked)
+            self.thumbs_toggle_btn = btn
+            actions = tb.actions()
+            first = actions[0] if actions else None
+            if first is not None:
+                tb.insertWidget(first, btn)
+                tb.insertSeparator(first)
+            else:
+                tb.addWidget(btn)
+                tb.addSeparator()
 
     def _read_thumbs_panel_visibility(self) -> "bool | None":
         try:
