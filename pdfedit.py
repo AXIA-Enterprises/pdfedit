@@ -1188,6 +1188,29 @@ def _read_form_panel_default_visible() -> bool:
         return bool(v)
 
 
+class _OverflowVisibleToolBar(QToolBar):
+    """QToolBar that paints its overflow chevron as a visible » glyph.
+
+    Qt's auto-inserted extension button draws an arrow via QStyle's
+    SP_ToolBarHorizontalExtensionButton pixmap; on a dark theme that pixmap
+    renders dark-on-dark and is effectively invisible. QSS qproperty-text
+    is ignored because the button uses arrowType, not text. We intercept
+    after every resize and force the button into ToolButtonTextOnly mode
+    with a clear glyph and arrow disabled.
+    """
+
+    def resizeEvent(self, ev):  # type: ignore[override]
+        super().resizeEvent(ev)
+        ext = self.findChild(QToolButton, "qt_toolbar_ext_button")
+        if ext is None:
+            return
+        if not ext.property("_pdfedit_styled"):
+            ext.setArrowType(Qt.ArrowType.NoArrow)
+            ext.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+            ext.setText("»")
+            ext.setProperty("_pdfedit_styled", True)
+
+
 class SettingsDialog(QDialog):
     """Adobe-Acrobat-style preferences dialog.
 
@@ -8000,7 +8023,7 @@ class MainWindow(QMainWindow):
         self.in_app_menubar.setSizePolicy(
             QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed
         )
-        tb = QToolBar("Main")
+        tb = _OverflowVisibleToolBar("Main")
         tb.setObjectName("MainToolBar")
         tb.setMovable(False)
         tb.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
@@ -8031,12 +8054,10 @@ class MainWindow(QMainWindow):
         for act in self._tool_actions:
             tb.addAction(act)
 
-        # Find box on the right
-        spacer = QLabel()
-        spacer.setSizePolicy(
-            spacer.sizePolicy().Policy.Expanding, spacer.sizePolicy().Policy.Preferred
-        )
-        tb.addWidget(spacer)
+        # Find box lives on the menubar row (built later) so it's never pushed
+        # into the overflow chevron — it's always visible. Construct the
+        # widgets here so other init paths can wire up self.find_box, but
+        # add them to in_app_menubar at the end of _build_toolbar.
         self.find_box = QLineEdit()
         self.find_box.setPlaceholderText("Find…")
         self.find_box.setFixedWidth(180)
@@ -8045,20 +8066,16 @@ class MainWindow(QMainWindow):
             QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
         )
         self.find_box.returnPressed.connect(self.find_next)
-        tb.addWidget(self.find_box)
         self.find_case_chk = QCheckBox("Match case")
         # PyMuPDF's search_for is case-insensitive; we filter results when
         # this is on. Toggling resets the cached query so the next find re-runs.
         self.find_case_chk.toggled.connect(self._on_find_case_toggled)
-        tb.addWidget(self.find_case_chk)
         self.find_status = QLabel("")
-        tb.addWidget(self.find_status)
-
         # Wire ⌘F to focus the find box
         self.act_find.triggered.connect(self.find_box.setFocus)
 
         # ---- Format toolbar (third row) ----
-        fmt = QToolBar("Format")
+        fmt = _OverflowVisibleToolBar("Format")
         fmt.setObjectName("FormatToolBar")
         fmt.setMovable(False)
         fmt.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
@@ -8226,6 +8243,17 @@ class MainWindow(QMainWindow):
                     menu.addAction(it)
             btn.setMenu(menu)
             self.in_app_menubar.addWidget(btn)
+
+        # Push the find widgets to the right end of the menubar row so they
+        # always have space and never get pushed into an overflow chevron.
+        find_spacer = QLabel()
+        find_spacer.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        self.in_app_menubar.addWidget(find_spacer)
+        self.in_app_menubar.addWidget(self.find_box)
+        self.in_app_menubar.addWidget(self.find_case_chk)
+        self.in_app_menubar.addWidget(self.find_status)
 
         self.refresh_format_toolbar()
         self._install_tool_shortcuts()
