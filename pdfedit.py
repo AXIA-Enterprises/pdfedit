@@ -748,7 +748,7 @@ QToolButton:pressed, QToolButton:checked {{
     border-color: {p['accent']};
     color: {p['accent']};
 }}
-QToolButton::menu-indicator {{ image: none; width: 0px; }}
+QToolBar#InAppMenuBar QToolButton::menu-indicator {{ image: none; width: 0px; }}
 
 /* ---- Menu bar / Menus ---- */
 QMenuBar {{

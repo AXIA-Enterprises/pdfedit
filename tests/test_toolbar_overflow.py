@@ -36,6 +36,25 @@ def test_minimum_width_is_reasonable(main_window):
     assert main_window.minimumWidth() >= 200
 
 
+def test_qss_does_not_globally_hide_menu_indicator(main_window):
+    """Regression: a global ``QToolButton::menu-indicator { width: 0 }`` rule
+    in the QSS made the toolbar's auto-inserted ``>>`` chevron invisible
+    (the chevron icon IS that menu-indicator). The rule must be scoped to
+    the in-app menubar only."""
+    from PyQt6.QtWidgets import QApplication
+    qss = QApplication.instance().styleSheet()
+    # Must NOT contain an unscoped `QToolButton::menu-indicator` rule with a
+    # zero-width override. Scoped variants (e.g. `QToolBar#InAppMenuBar
+    # QToolButton::menu-indicator`) are fine.
+    for line in qss.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("QToolButton::menu-indicator"):
+            raise AssertionError(
+                "Global QToolButton::menu-indicator rule kills the toolbar "
+                "extension chevron — must be scoped to InAppMenuBar."
+            )
+
+
 def test_find_box_capped(main_window):
     """find_box must have a max width so it can't steal toolbar space."""
     assert main_window.find_box.maximumWidth() <= 220
