@@ -2783,6 +2783,109 @@ BASE14_VARIANTS = {
 }
 
 
+def _pdf_span_color_to_rgb(c) -> tuple[float, float, float]:
+    """Decode a PyMuPDF span color (sRGB int 0xRRGGBB) into a 0..1 RGB tuple."""
+    if isinstance(c, (tuple, list)) and len(c) >= 3:
+        return (float(c[0]), float(c[1]), float(c[2]))
+    try:
+        ci = int(c)
+    except (TypeError, ValueError):
+        return (0.0, 0.0, 0.0)
+    r = ((ci >> 16) & 0xFF) / 255.0
+    g = ((ci >> 8) & 0xFF) / 255.0
+    b = (ci & 0xFF) / 255.0
+    return (r, g, b)
+
+
+def _find_text_line_at(page, x: float, y: float):
+    """Locate the text line under (x, y) on `page`. Returns a dict
+    with keys `bbox` (fitz.Rect), `spans` (list of original span dicts),
+    `text` (joined string), or None if no line covers the point.
+
+    When multiple lines overlap (e.g. nested blocks), prefer the line
+    whose bbox has the smallest area.
+    """
+    try:
+        d = page.get_text("dict")
+    except Exception:
+        return None
+    candidates = []
+    for block in d.get("blocks", []):
+        if "lines" not in block:
+            continue
+        for line in block["lines"]:
+            bbox = line.get("bbox")
+            if not bbox or len(bbox) != 4:
+                continue
+            x0, y0, x1, y1 = bbox
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                area = max(1e-6, (x1 - x0) * (y1 - y0))
+                candidates.append((area, line))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: t[0])
+    line = candidates[0][1]
+    spans = list(line.get("spans", []))
+    text = "".join(s.get("text", "") for s in spans)
+    return {
+        "bbox": fitz.Rect(*line["bbox"]),
+        "spans": spans,
+        "text": text,
+    }
+
+
+_PDF_FONT_NAME_FALLBACKS = (
+    ("times", "tiro"),
+    ("timesnewroman", "tiro"),
+    ("serif", "tiro"),
+    ("helvetica", "helv"),
+    ("arial", "helv"),
+    ("liberationsans", "helv"),
+    ("verdana", "helv"),
+    ("calibri", "helv"),
+    ("sans", "helv"),
+    ("courier", "cour"),
+    ("mono", "cour"),
+)
+
+
+def _match_pdf_font_for_edit(font_name: str, size: float, flags: int, page):
+    """Pick a PyMuPDF fontname best matching the original span's font.
+
+    Returns (resolved_fontname, original_font_str_or_None_if_clean_match).
+    A non-None second value signals "substituted" — caller may surface a
+    warning. The match strips style suffixes ("Bold", "Italic"), then
+    lower-cases and strips non-letters before substring-matching against
+    a small alias table. Bold/italic flags from the span (bit 16=bold,
+    bit 1=italic per PDF /Flags) refine to base14 variants.
+    """
+    raw = font_name or ""
+    bold = bool(flags & 16) or "bold" in raw.lower() or "black" in raw.lower()
+    italic = bool(flags & 2) or "italic" in raw.lower() or "oblique" in raw.lower()
+    cleaned = re.sub(r"[^A-Za-z]", "", raw).lower()
+    cleaned = re.sub(r"(bold|italic|oblique|black|regular|roman|medium|light|semibold)", "", cleaned)
+    family_key = None
+    for needle, _ in _PDF_FONT_NAME_FALLBACKS:
+        if needle in cleaned:
+            family_key = needle
+            break
+    if family_key is None:
+        return ("helv", raw if raw else "(unknown)")
+    if family_key in ("times", "timesnewroman", "serif"):
+        variants = BASE14_VARIANTS["Times"]
+    elif family_key in ("courier", "mono"):
+        variants = BASE14_VARIANTS["Courier"]
+    else:
+        variants = BASE14_VARIANTS["Helvetica"]
+    if bold and italic:
+        return (variants[3], None)
+    if bold:
+        return (variants[1], None)
+    if italic:
+        return (variants[2], None)
+    return (variants[0], None)
+
+
 class _ResizeHandle(QGraphicsRectItem):
     """Bottom-right corner handle for resizing a TextBoxItem's text width."""
 
@@ -3568,6 +3671,9 @@ class PDFView(QGraphicsView):
         if mode == "select":
             self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
             self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+        elif mode == "edit-text":
+            self.setDragMode(QGraphicsView.DragMode.NoDrag)
+            self.viewport().setCursor(Qt.CursorShape.IBeamCursor)
         else:
             self.setDragMode(QGraphicsView.DragMode.NoDrag)
             self.viewport().setCursor(Qt.CursorShape.CrossCursor)
@@ -3760,10 +3866,12 @@ class PDFView(QGraphicsView):
                 return super().keyReleaseEvent(ev)
             self._space_pan = False
             self.setDragMode(self._saved_drag_mode)
-            cursor = (
-                Qt.CursorShape.ArrowCursor if self.mode == "select"
-                else Qt.CursorShape.CrossCursor
-            )
+            if self.mode == "select":
+                cursor = Qt.CursorShape.ArrowCursor
+            elif self.mode == "edit-text":
+                cursor = Qt.CursorShape.IBeamCursor
+            else:
+                cursor = Qt.CursorShape.CrossCursor
             self.viewport().setCursor(cursor)
             ev.accept()
             return
@@ -3802,6 +3910,10 @@ class PDFView(QGraphicsView):
         loc = self._locate(sp)
         if loc is None:
             return  # click landed in the gutter between pages
+        if self.mode == "edit-text" and ev.button() == Qt.MouseButton.LeftButton:
+            page_idx, px, py = loc
+            self.window_._open_edit_text_at(page_idx, px, py, sp)
+            return
         self._start_scene = sp
         self._start_page, sx, sy = loc
         self._start_pdf = (sx, sy)
@@ -5945,6 +6057,62 @@ class TabOrderDialog(QDialog):
 MAX_UNDO = 30
 
 
+class EditTextPopup(QLineEdit):
+    """Frameless single-line popup for editing PDF text in place.
+
+    Floats over the original text rect at the line's mapped screen
+    position. Enter/Return commits via on_commit(new_text); Esc cancels.
+    Focus-out also commits via a short QTimer.singleShot grace period
+    so a fast click outside doesn't lose pending edits before the user
+    realizes the popup was open.
+    """
+
+    def __init__(self, parent, *, original_text: str, on_commit, on_cancel,
+                 font_size_px: int = 14):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        self.setText(original_text)
+        self.selectAll()
+        self._on_commit = on_commit
+        self._on_cancel = on_cancel
+        self._done = False
+        f = self.font()
+        f.setPixelSize(max(10, int(font_size_px)))
+        self.setFont(f)
+        self.returnPressed.connect(self._commit)
+
+    def _commit(self):
+        if self._done:
+            return
+        self._done = True
+        text = self.text()
+        try:
+            self._on_commit(text)
+        finally:
+            self.close()
+
+    def _cancel(self):
+        if self._done:
+            return
+        self._done = True
+        try:
+            self._on_cancel()
+        finally:
+            self.close()
+
+    def keyPressEvent(self, ev):
+        if ev.key() == Qt.Key.Key_Escape:
+            self._cancel()
+            ev.accept()
+            return
+        super().keyPressEvent(ev)
+
+    def focusOutEvent(self, ev):
+        super().focusOutEvent(ev)
+        if not self._done:
+            QTimer.singleShot(100, self._commit)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -6126,6 +6294,7 @@ class MainWindow(QMainWindow):
             "strikeout": "Drag across text to strike out. (K)",
             "sticky": "Click to add a sticky note. (N)",
             "erase": "Drag a rectangle to white out (redact) content. (E)",
+            "edit-text": "Edit existing text. Click on text to replace it.",
             "image": "Click on the page to insert an image file. (I)",
             "form-text": "Drag to add a single-line fillable text field. Properties dialog opens for tooltip, default value, format.",
             "form-multiline": "Drag to add a multi-line text area for paragraphs of input.",
@@ -6169,6 +6338,7 @@ class MainWindow(QMainWindow):
             ("Strikeout", "strikeout"),
             ("Sticky Note", "sticky"),
             ("Erase", "erase"),
+            ("Edit Text", "edit-text"),
             ("Image", "image"),
             ("Text Field", "form-text"),
             ("Multi-line Text", "form-multiline"),
@@ -6327,9 +6497,12 @@ class MainWindow(QMainWindow):
         # ---- Menu structure (label, list of actions; None = separator;
         # QMenu = submenu) -----------------------------------------------
         _form_action_set = set(self._form_actions)
+        edit_text_action = next(
+            (a for a in self._tool_actions if a.data() == "edit-text"), None
+        )
         _insert_actions = [
             a for a in self._tool_actions
-            if a not in _form_action_set and a.data() != "select"
+            if a not in _form_action_set and a.data() not in ("select", "edit-text")
         ]
         format_menu = QMenu("&Format", self)
         for fa in (self.act_bold, self.act_italic, self.act_underline,
@@ -6349,6 +6522,8 @@ class MainWindow(QMainWindow):
                        self.act_preferences]),
             ("&Edit", [self.act_undo, self.act_redo, None,
                        self.act_find, self.act_find_next, self.act_find_prev,
+                       None,
+                       *([edit_text_action] if edit_text_action is not None else []),
                        None, format_menu]),
             ("&View", [self.act_prev, self.act_next, None,
                        self.act_zoom_in, self.act_zoom_out, self.act_zoom_reset]),
@@ -7771,6 +7946,159 @@ class MainWindow(QMainWindow):
         page.apply_redactions()
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
+
+    def _open_edit_text_at(self, page_idx: int, px: float, py: float,
+                            scene_pt: QPointF | None = None) -> None:
+        """Locate the text line under (px, py) and open an inline-edit popup.
+
+        If no text is found at the click point, surfaces a status message
+        so the user knows they need to click directly on rendered text.
+        """
+        if not self.view.doc:
+            return
+        try:
+            page = self.view.doc[page_idx]
+        except Exception:
+            return
+        line_info = _find_text_line_at(page, px, py)
+        if not line_info:
+            self.statusBar().showMessage(
+                "No editable text under the click — try clicking directly on a line of text."
+            )
+            return
+        bbox = line_info["bbox"]
+        spans = line_info["spans"]
+        original = line_info["text"]
+
+        scene_rect = self.view._pdf_rect_to_scene(page_idx, bbox)
+        view_top_left = self.view.mapFromScene(scene_rect.topLeft())
+        view_bottom_right = self.view.mapFromScene(scene_rect.bottomRight())
+        screen_top_left = self.view.viewport().mapToGlobal(view_top_left)
+        screen_bottom_right = self.view.viewport().mapToGlobal(view_bottom_right)
+        width = max(80, screen_bottom_right.x() - screen_top_left.x() + 40)
+        height = max(22, screen_bottom_right.y() - screen_top_left.y() + 6)
+
+        first_size = 12.0
+        if spans:
+            try:
+                first_size = float(spans[0].get("size", 12.0))
+            except Exception:
+                first_size = 12.0
+        font_px = max(10, int(first_size * self.view.zoom))
+
+        def _commit(new_text: str):
+            if new_text == original:
+                self.statusBar().showMessage("Edit text: no change.")
+                return
+            self.apply_edit_text(page_idx, bbox, spans, new_text)
+
+        def _cancel():
+            self.statusBar().showMessage("Edit text: cancelled.")
+
+        popup = EditTextPopup(
+            self,
+            original_text=original,
+            on_commit=_commit,
+            on_cancel=_cancel,
+            font_size_px=font_px,
+        )
+        popup.setGeometry(
+            screen_top_left.x(), screen_top_left.y(), int(width), int(height)
+        )
+        popup.show()
+        popup.setFocus(Qt.FocusReason.MouseFocusReason)
+        self._active_edit_text_popup = popup
+
+    def apply_edit_text(self, page_idx: int, line_bbox, original_spans: list,
+                         new_text: str) -> dict:
+        """Replace the text in `line_bbox` on `page_idx` with `new_text`.
+
+        Pure-logic apply path: redacts the original line rect, then inserts
+        `new_text` at the same baseline using the first span's font/size/color
+        (mapped to a base14 PyMuPDF fontname). Returns a dict with keys:
+        `applied` (bool), `warnings` (list[str]), `overflow` (bool).
+
+        Limitations (real PDF caveats — these are NOT supported):
+          * Vertical / right-to-left text — assumes left-to-right horizontal.
+          * Justified text — replacement is single-run, no inter-word stretch.
+          * Ligatures and complex shaping — text is re-laid as plain glyphs.
+          * Multi-column overflow detection — overflow into adjacent columns
+            is flagged as a status warning but not prevented.
+          * Embedded subset fonts — original font is mapped to a base14
+            substitute; a warning is collected when the family isn't a clean
+            Times/Helvetica/Courier match.
+        """
+        warnings: list[str] = []
+        if not self.view.doc:
+            return {"applied": False, "warnings": ["no document open"], "overflow": False}
+        if page_idx < 0 or page_idx >= len(self.view.doc):
+            return {"applied": False, "warnings": ["page out of range"], "overflow": False}
+
+        rect = fitz.Rect(line_bbox)
+        first_span = original_spans[0] if original_spans else {}
+        size = float(first_span.get("size", 12.0))
+        flags = int(first_span.get("flags", 0))
+        original_font_name = str(first_span.get("font", "") or "")
+        color = _pdf_span_color_to_rgb(first_span.get("color", 0))
+
+        self._snapshot()
+        page = self.view.doc[page_idx]
+        try:
+            page.add_redact_annot(rect, fill=(1, 1, 1))
+            page.apply_redactions()
+        except Exception as exc:
+            warnings.append(f"redaction failed: {exc}")
+            return {"applied": False, "warnings": warnings, "overflow": False}
+
+        fontname, substituted = _match_pdf_font_for_edit(
+            original_font_name, size, flags, page
+        )
+        if substituted:
+            warnings.append(
+                f"Font '{substituted}' substituted with {fontname}."
+            )
+
+        baseline_y = rect.y1 - size * 0.3
+        origin = fitz.Point(rect.x0, baseline_y)
+
+        overflow = False
+        try:
+            new_w = fitz.get_text_length(new_text, fontname=fontname, fontsize=size)
+        except Exception:
+            new_w = len(new_text) * size * 0.55
+        if new_w > rect.width + 0.5:
+            overflow = True
+
+        try:
+            page.insert_text(
+                origin, new_text, fontname=fontname, fontsize=size, color=color
+            )
+        except Exception as exc:
+            warnings.append(
+                f"insert_text failed with '{fontname}' ({exc}); fell back to Helvetica."
+            )
+            try:
+                page.insert_text(
+                    origin, new_text, fontname="helv", fontsize=size, color=color
+                )
+            except Exception as exc2:
+                warnings.append(f"fallback insert_text also failed: {exc2}")
+                return {"applied": False, "warnings": warnings, "overflow": overflow}
+
+        self.view.render_all(preserve_scroll=True)
+        self._mark_dirty()
+        self._refresh_thumbnails_panel()
+
+        msgs = []
+        if overflow:
+            msgs.append("Replacement text is wider than the original line.")
+        if warnings:
+            msgs.extend(warnings)
+        if msgs:
+            self.statusBar().showMessage(" ".join(msgs))
+        else:
+            self.statusBar().showMessage("Edited text.")
+        return {"applied": True, "warnings": warnings, "overflow": overflow}
 
     def do_highlight(self, page_idx: int, x0, y0, x1, y1):
         if x1 - x0 < 2 or y1 - y0 < 2:
