@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -461,6 +462,169 @@ def open_folder_in_file_manager(folder: str) -> bool:
     except Exception as exc:
         print(f"[open_folder] failed: {exc}", file=sys.stderr)
         return False
+
+
+# ---------------------------------------------------------------------------
+# OCR (Tesseract)
+# ---------------------------------------------------------------------------
+
+# User-facing language label → tesseract code. Order is preserved in the combo.
+OCR_LANGUAGES: list[tuple[str, str]] = [
+    ("English", "eng"),
+    ("French", "fra"),
+    ("German", "deu"),
+    ("Spanish", "spa"),
+    ("Italian", "ita"),
+    ("Portuguese", "por"),
+    ("Russian", "rus"),
+    ("Chinese (Simplified)", "chi_sim"),
+    ("Japanese", "jpn"),
+    ("Auto-detect", "osd"),
+]
+
+OCR_INSTALL_HELP = (
+    "Recognize Text needs Tesseract OCR (and the pytesseract Python wrapper).\n\n"
+    "Install instructions:\n"
+    "  • macOS:        brew install tesseract\n"
+    "  • Ubuntu/Debian: sudo apt install tesseract-ocr\n"
+    "  • Windows:      download from https://github.com/UB-Mannheim/tesseract/wiki\n\n"
+    "Then install the Python wrapper:\n"
+    "  pip install pytesseract"
+)
+
+
+def _check_tesseract_available() -> tuple[bool, str]:
+    """Return (ok, reason). `ok` True only if both pytesseract and the binary exist.
+
+    Lazy: every call re-checks. Cheap enough (one shutil.which + one import) that
+    paying the cost on dialog open keeps the menu reactive to mid-session installs.
+    """
+    try:
+        import pytesseract  # noqa: F401
+    except Exception as exc:
+        return False, f"pytesseract not installed ({exc})"
+    if shutil.which("tesseract") is None:
+        return False, "tesseract binary not found on PATH"
+    return True, ""
+
+
+# Render zoom for OCR pixmaps. 3x ≈ 216 DPI — Tesseract's sweet spot for body
+# text. Higher costs memory + time; lower starts losing words.
+_OCR_ZOOM = 3.0
+_OCR_CONFIDENCE_MIN = 30
+
+
+def _ocr_page(page: "fitz.Page", lang: str, *, zoom: float = _OCR_ZOOM):
+    """Run Tesseract on `page` and insert invisible text glyphs over recognised words.
+
+    Returns ``(words_inserted, error_or_none)``. On failure the page is left
+    untouched and the caller decides whether to abort or carry on.
+    """
+    try:
+        import pytesseract
+        from PIL import Image
+    except Exception as exc:
+        return 0, f"missing dependency: {exc}"
+    try:
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        data = pytesseract.image_to_data(
+            img, lang=lang, output_type=pytesseract.Output.DICT
+        )
+    except Exception as exc:
+        return 0, f"tesseract failed: {exc}"
+
+    inserted = 0
+    n = len(data.get("text", []))
+    for i in range(n):
+        word = (data["text"][i] or "").strip()
+        if not word:
+            continue
+        try:
+            conf = float(data["conf"][i])
+        except (TypeError, ValueError):
+            continue
+        if conf < _OCR_CONFIDENCE_MIN:
+            continue
+        try:
+            x = float(data["left"][i]) / zoom
+            y = float(data["top"][i]) / zoom
+            w = float(data["width"][i]) / zoom
+            h = float(data["height"][i]) / zoom
+        except (TypeError, ValueError, KeyError):
+            continue
+        if w <= 0 or h <= 0:
+            continue
+        font_size = max(1.0, h * 0.85)
+        try:
+            page.insert_text(
+                (x, y + h * 0.85), word,
+                fontsize=font_size, fontname="helv",
+                render_mode=3,
+            )
+            inserted += 1
+        except Exception:
+            continue
+    return inserted, None
+
+
+def run_ocr_on_doc(
+    doc: "fitz.Document",
+    page_indices: list[int],
+    lang: str,
+    *,
+    skip_existing: bool = True,
+    progress_cb=None,
+) -> dict:
+    """Run OCR on selected pages of `doc`, mutating it in place.
+
+    Returns a summary dict with keys: ``processed``, ``skipped``, ``words``,
+    ``failures`` (list of "page N: reason"), ``cancelled`` (bool).
+
+    `progress_cb(idx, total)` is called once per page and may return False to
+    request cancellation (matches QProgressDialog.wasCanceled() shape).
+    """
+    summary = {
+        "processed": 0,
+        "skipped": 0,
+        "words": 0,
+        "failures": [],
+        "cancelled": False,
+    }
+    total = len(page_indices)
+    for n, page_idx in enumerate(page_indices):
+        if progress_cb is not None:
+            try:
+                cont = progress_cb(n, total)
+                if cont is False:
+                    summary["cancelled"] = True
+                    break
+            except Exception:
+                pass
+        if page_idx < 0 or page_idx >= len(doc):
+            summary["failures"].append(f"page {page_idx + 1}: out of range")
+            continue
+        page = doc[page_idx]
+        if skip_existing:
+            try:
+                existing = page.get_text().strip()
+            except Exception:
+                existing = ""
+            if existing:
+                summary["skipped"] += 1
+                continue
+        words, err = _ocr_page(page, lang)
+        if err is not None:
+            summary["failures"].append(f"page {page_idx + 1}: {err}")
+            continue
+        summary["processed"] += 1
+        summary["words"] += words
+    if progress_cb is not None:
+        try:
+            progress_cb(total, total)
+        except Exception:
+            pass
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -1534,6 +1698,69 @@ class WatermarkDialog(QDialog):
             "color": self.color,
             "all_pages": self.all_pages_chk.isChecked(),
             "range": self.range_edit.text(),
+        }
+
+
+class OCRDialog(QDialog):
+    """Configure a Tesseract OCR pass — page range, language, skip, output mode."""
+
+    OUTPUT_APPLY = "apply"
+    OUTPUT_NEW = "new"
+
+    def __init__(self, parent=None, page_count: int = 1):
+        super().__init__(parent)
+        self.setWindowTitle("Recognize Text")
+        self.setMinimumWidth(420)
+        self._page_count = max(1, int(page_count))
+
+        self.range_edit = QLineEdit("all")
+        self.range_edit.setPlaceholderText(
+            f"all  or  1,3-5  (1–{self._page_count})"
+        )
+
+        self.lang_box = QComboBox()
+        for label, _code in OCR_LANGUAGES:
+            self.lang_box.addItem(label)
+        self.lang_box.setCurrentIndex(0)
+
+        self.skip_existing_chk = QCheckBox(
+            "Skip pages that already have selectable text"
+        )
+        self.skip_existing_chk.setChecked(True)
+
+        self.apply_radio = QRadioButton("Apply to current document")
+        self.new_radio = QRadioButton("Save as new file")
+        self.apply_radio.setChecked(True)
+        self._output_group = QButtonGroup(self)
+        self._output_group.addButton(self.apply_radio)
+        self._output_group.addButton(self.new_radio)
+
+        form = QFormLayout()
+        form.addRow("Pages:", self.range_edit)
+        form.addRow("Language:", self.lang_box)
+        form.addRow("", self.skip_existing_chk)
+        form.addRow("Output:", self.apply_radio)
+        form.addRow("", self.new_radio)
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(bb)
+
+    def values(self) -> dict:
+        idx = self.lang_box.currentIndex()
+        label, code = OCR_LANGUAGES[idx]
+        return {
+            "range": self.range_edit.text().strip(),
+            "lang_label": label,
+            "lang": code,
+            "skip_existing": self.skip_existing_chk.isChecked(),
+            "output_mode": self.OUTPUT_NEW if self.new_radio.isChecked() else self.OUTPUT_APPLY,
         }
 
 
@@ -6243,6 +6470,13 @@ class MainWindow(QMainWindow):
 
         # Tools (one-shot)
         self.act_watermark = make("Watermark…", self.do_watermark)
+        self.act_ocr = make("Recognize Text…", self.run_ocr)
+        ok, reason = _check_tesseract_available()
+        if not ok:
+            self.act_ocr.setToolTip(
+                "Tesseract OCR not available — " + reason
+                + ". Click for install instructions."
+            )
 
         # Forms (one-shot)
         self.act_tab_order = make("Tab Order…", self.open_tab_order_dialog)
@@ -6531,7 +6765,7 @@ class MainWindow(QMainWindow):
             ("&Pages", [self.act_insert_blank, self.act_rotate, self.act_delete_page]),
             ("&Forms", [*self._form_actions, None, self.act_tab_order,
                         None, self.act_reset_form, self.act_flatten_form]),
-            ("&Tools", [self.act_watermark]),
+            ("&Tools", [self.act_watermark, self.act_ocr]),
         ]
         self._menu_spec = menu_spec
 
@@ -7478,6 +7712,150 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Applied watermark to {applied} page(s)"
         )
+
+    # ---------------- Recognize Text (OCR) ----------------
+    def run_ocr(self):
+        ok, reason = _check_tesseract_available()
+        if not ok:
+            QMessageBox.warning(
+                self, "Recognize Text",
+                f"{OCR_INSTALL_HELP}\n\nDetected: {reason}",
+            )
+            return
+        if not self.view.doc:
+            QMessageBox.information(
+                self, "Recognize Text",
+                "Open or create a PDF first to run OCR on.",
+            )
+            return
+        page_count = len(self.view.doc)
+        dlg = OCRDialog(self, page_count=page_count)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        v = dlg.values()
+        spec = v["range"]
+        if not spec or spec.lower() == "all":
+            indices = list(range(page_count))
+        else:
+            try:
+                indices, warnings = parse_page_range(spec, page_count)
+            except ValueError as exc:
+                QMessageBox.warning(self, "Recognize Text", f"Bad page range: {exc}")
+                return
+            if warnings:
+                QMessageBox.warning(
+                    self, "Recognize Text",
+                    "Page range had issues:\n\n" + "\n".join(f"  • {w}" for w in warnings),
+                )
+            if not indices:
+                QMessageBox.warning(self, "Recognize Text", "No pages selected.")
+                return
+
+        output_mode = v["output_mode"]
+        if output_mode == "apply":
+            confirm = QMessageBox.question(
+                self, "Recognize Text",
+                f"Run OCR on {len(indices)} page(s) and modify the current document?\n\n"
+                "You can still Undo or save the result to a different file afterwards.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+            target_doc = self.view.doc
+            new_path = None
+        else:
+            new_path, _ = QFileDialog.getSaveFileName(
+                self, "Save OCR'd PDF As", "", "PDF Files (*.pdf)"
+            )
+            if not new_path:
+                return
+            if not new_path.lower().endswith(".pdf"):
+                new_path += ".pdf"
+            try:
+                clone_bytes = self.view.doc.tobytes()
+                target_doc = fitz.open(stream=clone_bytes, filetype="pdf")
+            except Exception as exc:
+                QMessageBox.warning(self, "Recognize Text", f"Could not clone document: {exc}")
+                return
+
+        progress = QProgressDialog(
+            "Running OCR…", "Cancel", 0, max(1, len(indices)), self
+        )
+        progress.setWindowTitle("Recognize Text")
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        QApplication.processEvents()
+
+        def _cb(n, total):
+            progress.setMaximum(max(1, total))
+            progress.setValue(n)
+            progress.setLabelText(f"OCR page {min(n + 1, total)} of {total}…")
+            QApplication.processEvents()
+            return not progress.wasCanceled()
+
+        if output_mode == "apply":
+            self._snapshot()
+        try:
+            summary = run_ocr_on_doc(
+                target_doc, indices, v["lang"],
+                skip_existing=v["skip_existing"],
+                progress_cb=_cb,
+            )
+        finally:
+            progress.close()
+
+        if output_mode == "new":
+            try:
+                target_doc.save(new_path, garbage=4, deflate=True)
+            except Exception as exc:
+                QMessageBox.warning(self, "Recognize Text", f"Save failed: {exc}")
+                try:
+                    target_doc.close()
+                except Exception:
+                    pass
+                return
+            try:
+                target_doc.close()
+            except Exception:
+                pass
+        else:
+            if summary["processed"] > 0 or summary["words"] > 0:
+                self._mark_dirty()
+            else:
+                if self._undo:
+                    try:
+                        self._undo.pop()
+                    except Exception:
+                        pass
+            self.view.render_all(preserve_scroll=True)
+            self._refresh_form_panel()
+            self._refresh_thumbnails_panel()
+
+        msg = (
+            f"OCR complete: {summary['processed']} page(s) processed, "
+            f"{summary['words']} word(s) detected."
+        )
+        if summary["skipped"]:
+            msg += f" {summary['skipped']} skipped (already searchable)."
+        if summary["cancelled"]:
+            msg += " Cancelled before finish."
+        if output_mode == "apply" and not summary["cancelled"] and summary["processed"]:
+            msg += " Doc is now searchable."
+        self.statusBar().showMessage(msg)
+
+        if summary["failures"]:
+            body = "\n".join(f"  • {f}" for f in summary["failures"])
+            QMessageBox.warning(
+                self, "Recognize Text",
+                f"OCR finished with {len(summary['failures'])} failure(s):\n\n{body}",
+            )
+        elif output_mode == "new":
+            QMessageBox.information(
+                self, "Recognize Text",
+                f"Saved searchable PDF to:\n{new_path}\n\n"
+                f"{summary['processed']} page(s) processed, "
+                f"{summary['words']} word(s) detected.",
+            )
 
     def merge_pdfs(self, _checked=False, *, paths: list[str] | None = None):
         if not self.view.doc:
