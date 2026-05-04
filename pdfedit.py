@@ -1849,6 +1849,103 @@ class AddTextDialog(QDialog):
         )
 
 
+class CropConfirmDialog(QDialog):
+    """Confirm a Crop Pages operation with scope (current/all/range).
+
+    The dragged rect is shown read-only at the top so the user can verify
+    they're cropping what they meant. Scope picks which pages get the same
+    PDF-coordinate cropbox. Range reuses parse_page_range so "1,3-5,8"
+    and friendly edge cases work out of the box.
+    """
+
+    SCOPE_CURRENT = "current"
+    SCOPE_ALL = "all"
+    SCOPE_RANGE = "range"
+
+    def __init__(self, parent, *, page_idx: int, page_count: int,
+                 rect: tuple[float, float, float, float],
+                 page_w: float, page_h: float):
+        super().__init__(parent)
+        self.setWindowTitle("Apply Crop")
+        self.setMinimumWidth(360)
+        self._rect = rect
+        self._page_count = page_count
+
+        x0, y0, x1, y1 = rect
+        info = QLabel(
+            f"Crop rect: {x1 - x0:.0f} × {y1 - y0:.0f} pt "
+            f"(at {x0:.0f}, {y0:.0f} on a {page_w:.0f} × {page_h:.0f} pt page)"
+        )
+        info.setWordWrap(True)
+
+        self.preview = QLabel()
+        self.preview.setMinimumHeight(120)
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._draw_preview(page_w, page_h)
+
+        scope_box = QGroupBox("Apply to")
+        self.rb_current = QRadioButton(f"Current page (page {page_idx + 1})")
+        self.rb_all = QRadioButton(f"All pages ({page_count})")
+        self.rb_range = QRadioButton("Page range:")
+        self.rb_current.setChecked(True)
+        self.range_edit = QLineEdit()
+        self.range_edit.setPlaceholderText("e.g. 1,3-5")
+        self.range_edit.setEnabled(False)
+        self.rb_range.toggled.connect(self.range_edit.setEnabled)
+        scope_layout = QVBoxLayout(scope_box)
+        scope_layout.addWidget(self.rb_current)
+        scope_layout.addWidget(self.rb_all)
+        row = QHBoxLayout()
+        row.addWidget(self.rb_range)
+        row.addWidget(self.range_edit, 1)
+        scope_layout.addLayout(row)
+
+        bb = QDialogButtonBox()
+        self.btn_apply = bb.addButton("Apply Crop", QDialogButtonBox.ButtonRole.AcceptRole)
+        bb.addButton("Cancel", QDialogButtonBox.ButtonRole.RejectRole)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(info)
+        layout.addWidget(self.preview)
+        layout.addWidget(scope_box)
+        layout.addWidget(bb)
+
+    def _draw_preview(self, page_w: float, page_h: float):
+        max_dim = 200
+        scale = min(max_dim / page_w, max_dim / page_h, 0.6)
+        pw = max(1, int(page_w * scale))
+        ph = max(1, int(page_h * scale))
+        pm = QPixmap(pw + 2, ph + 2)
+        pm.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pm)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor(120, 120, 120), 1))
+        painter.setBrush(QBrush(QColor(245, 245, 245)))
+        painter.drawRect(1, 1, pw, ph)
+        x0, y0, x1, y1 = self._rect
+        rx = int(x0 * scale) + 1
+        ry = int(y0 * scale) + 1
+        rw = max(1, int((x1 - x0) * scale))
+        rh = max(1, int((y1 - y0) * scale))
+        painter.setPen(QPen(QColor(60, 130, 220), 2))
+        painter.setBrush(QBrush(QColor(60, 130, 220, 60)))
+        painter.drawRect(rx, ry, rw, rh)
+        painter.end()
+        self.preview.setPixmap(pm)
+
+    def scope(self) -> str:
+        if self.rb_all.isChecked():
+            return self.SCOPE_ALL
+        if self.rb_range.isChecked():
+            return self.SCOPE_RANGE
+        return self.SCOPE_CURRENT
+
+    def range_text(self) -> str:
+        return self.range_edit.text()
+
+
 # (label, width_inches, height_inches) — None means insert separator
 PAGE_PRESETS: list[tuple[str, float | None, float | None]] = [
     ("US Letter (8.5 × 11 in)", 8.5, 11.0),
@@ -4602,7 +4699,7 @@ class PDFView(QGraphicsView):
 
         if self.mode in ("erase", "form-text", "form-check", "highlight",
                           "underline", "strikeout",
-                          "add-text", "signature", "image"):
+                          "add-text", "signature", "image", "crop"):
             if self.mode == "highlight":
                 line_color = QColor(245, 220, 20, 220)
                 fill = QColor(245, 220, 20, 90)
@@ -4612,6 +4709,9 @@ class PDFView(QGraphicsView):
             elif self.mode in ("add-text", "signature", "image"):
                 line_color = QColor(60, 130, 220, 220)
                 fill = QColor(60, 130, 220, 50)
+            elif self.mode == "crop":
+                line_color = QColor(40, 100, 200, 230)
+                fill = QColor(40, 100, 200, 40)
             else:
                 line_color = QColor(220, 60, 60, 220)
                 fill = QColor(220, 60, 60, 50)
@@ -4759,6 +4859,8 @@ class PDFView(QGraphicsView):
             self.window_.do_form_date(page, rx0, ry0, rx1, ry1)
         elif mode == "form-button":
             self.window_.do_form_button(page, rx0, ry0, rx1, ry1)
+        elif mode == "crop":
+            self.window_.do_crop(page, rx0, ry0, rx1, ry1)
 
     def mouseDoubleClickEvent(self, ev):
         # Double-click a form field in select mode → open Field Properties.
@@ -7057,6 +7159,7 @@ class MainWindow(QMainWindow):
         self.act_rotate = make("Rotate Page", self.rotate_current_page)
         self.act_insert_blank = make("Insert Blank Page", self.insert_blank_page)
         self.act_delete_page = make("Delete Page", self.delete_current_page)
+        self.act_reset_crop = make("Reset Crop…", self.reset_crop_dialog)
 
         # Tools (mutually exclusive, checkable — used in both menu and toolbar)
         self._tool_group = QActionGroup(self)
@@ -7087,6 +7190,7 @@ class MainWindow(QMainWindow):
             "draw-ellipse": "Drag a bounding box to draw an ellipse. (O)",
             "draw-line": "Drag from start to end to draw a line. (L)",
             "draw-arrow": "Drag from start to end to draw an arrow. (W)",
+            "crop": "Drag a rectangle, then choose pages to crop. (C)",
         }
         # Single-key shortcuts. We gate them at the QShortcut level (see
         # _install_tool_shortcuts) so they don't fire while typing into a
@@ -7109,6 +7213,7 @@ class MainWindow(QMainWindow):
             "draw-ellipse": "O",
             "draw-line": "L",
             "draw-arrow": "W",
+            "crop": "C",
         }
         self._form_actions: list[QAction] = []
         form_modes = {
@@ -7141,6 +7246,7 @@ class MainWindow(QMainWindow):
             ("Ellipse", "draw-ellipse"),
             ("Line", "draw-line"),
             ("Arrow", "draw-arrow"),
+            ("Crop", "crop"),
         ):
             act = make(label, None, checkable=True)
             act.setToolTip(tool_tooltips.get(mode, label))
@@ -7320,7 +7426,9 @@ class MainWindow(QMainWindow):
             ("&View", [self.act_prev, self.act_next, None,
                        self.act_zoom_in, self.act_zoom_out, self.act_zoom_reset]),
             ("&Insert", [*_insert_actions, None, self.act_page_numbers]),
-            ("&Pages", [self.act_insert_blank, self.act_rotate, self.act_delete_page]),
+            ("&Pages", [self.act_insert_blank, self.act_rotate, self.act_delete_page,
+                         None,
+                         self._crop_tool_action(), self.act_reset_crop]),
             ("&Forms", [*self._form_actions, None, self.act_tab_order,
                         None, self.act_reset_form, self.act_flatten_form]),
             ("&Tools", [self.act_watermark, self.act_ocr]),
@@ -9990,6 +10098,150 @@ class MainWindow(QMainWindow):
         self._refresh_form_panel()
         self._refresh_thumbnails_panel()
         self.statusBar().showMessage(f"Deleted page {idx + 1}")
+
+    # --- Crop ---
+    def _crop_tool_action(self) -> QAction | None:
+        """Return the existing checkable Crop tool action so it can be reused
+        in the Pages menu without creating a duplicate."""
+        for act in getattr(self, "_tool_actions", []):
+            if act.data() == "crop":
+                return act
+        return None
+
+    def do_crop(self, page_idx: int, x0: float, y0: float, x1: float, y1: float):
+        """Drag-end handler for the crop tool — opens the confirm dialog."""
+        if not self.view.doc:
+            return
+        if (x1 - x0) < 30 or (y1 - y0) < 30:
+            self.statusBar().showMessage("Crop area too small")
+            return
+        page = self.view.doc[page_idx]
+        # The drag gives us coordinates in the page's user space (the current
+        # cropbox). PyMuPDF's set_cropbox expects mediabox-space coordinates,
+        # so translate by the current cropbox offset before applying.
+        cb = page.cropbox
+        mb_rect = (cb.x0 + x0, cb.y0 + y0, cb.x0 + x1, cb.y0 + y1)
+        page_w = page.rect.width
+        page_h = page.rect.height
+        dlg = CropConfirmDialog(
+            self,
+            page_idx=page_idx,
+            page_count=len(self.view.doc),
+            rect=(x0, y0, x1, y1),
+            page_w=page_w,
+            page_h=page_h,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            self.statusBar().showMessage("Crop cancelled")
+            self._activate_tool("select")
+            return
+        scope = dlg.scope()
+        if scope == CropConfirmDialog.SCOPE_ALL:
+            page_indices = list(range(len(self.view.doc)))
+        elif scope == CropConfirmDialog.SCOPE_RANGE:
+            try:
+                indices, warnings = parse_page_range(
+                    dlg.range_text(), len(self.view.doc)
+                )
+            except ValueError as exc:
+                QMessageBox.warning(self, "Invalid page range", str(exc))
+                return
+            if warnings:
+                QMessageBox.warning(
+                    self, "Page range warnings", "\n".join(warnings)
+                )
+            if not indices:
+                self.statusBar().showMessage("Crop cancelled — empty page range")
+                return
+            page_indices = indices
+        else:
+            page_indices = [page_idx]
+        n = self.apply_crop_to_pages(mb_rect, page_indices)
+        if n == 1:
+            self.statusBar().showMessage(f"Cropped page {page_indices[0] + 1}")
+        else:
+            self.statusBar().showMessage(f"Cropped {n} pages")
+        self._activate_tool("select")
+
+    def apply_crop_to_pages(self, rect: tuple[float, float, float, float],
+                              page_indices: list[int]) -> int:
+        """Apply ``rect`` (mediabox-space PDF coords) as the cropbox on each
+        listed page, clamped to that page's mediabox. Snapshots once, then
+        re-renders + refreshes thumbnails. Returns the count actually cropped.
+        """
+        if not self.view.doc or not page_indices:
+            return 0
+        x0, y0, x1, y1 = rect
+        self._snapshot()
+        applied = 0
+        for idx in page_indices:
+            if idx < 0 or idx >= len(self.view.doc):
+                continue
+            page = self.view.doc[idx]
+            mb = page.mediabox
+            cx0 = max(mb.x0, min(mb.x1, x0))
+            cy0 = max(mb.y0, min(mb.y1, y0))
+            cx1 = max(mb.x0, min(mb.x1, x1))
+            cy1 = max(mb.y0, min(mb.y1, y1))
+            if (cx1 - cx0) < 1 or (cy1 - cy0) < 1:
+                continue
+            try:
+                page.set_cropbox(fitz.Rect(cx0, cy0, cx1, cy1))
+                applied += 1
+            except Exception as exc:
+                print(f"[crop] page {idx}: {exc}", file=sys.stderr)
+        self.view.render_all(preserve_scroll=True)
+        self._search_results = []
+        self._search_idx = -1
+        self.find_status.setText("")
+        self.view.show_search_overlays([])
+        self._mark_dirty()
+        self._refresh_thumbnails_panel()
+        return applied
+
+    def reset_crop_dialog(self):
+        """Reset cropbox to mediabox on the current page or all pages."""
+        if not self.view.doc:
+            return
+        idx = self.view.page_idx
+        scope, ok = QInputDialog.getItem(
+            self,
+            "Reset Crop",
+            "Reset the cropbox to the original page size for:",
+            [f"Current page (page {idx + 1})", f"All pages ({len(self.view.doc)})"],
+            0,
+            False,
+        )
+        if not ok:
+            return
+        if scope.startswith("All"):
+            indices = list(range(len(self.view.doc)))
+        else:
+            indices = [idx]
+        n = self.reset_crop_on_pages(indices)
+        if n == 1:
+            self.statusBar().showMessage(f"Reset crop on page {indices[0] + 1}")
+        else:
+            self.statusBar().showMessage(f"Reset crop on {n} pages")
+
+    def reset_crop_on_pages(self, page_indices: list[int]) -> int:
+        if not self.view.doc or not page_indices:
+            return 0
+        self._snapshot()
+        applied = 0
+        for idx in page_indices:
+            if idx < 0 or idx >= len(self.view.doc):
+                continue
+            page = self.view.doc[idx]
+            try:
+                page.set_cropbox(fitz.Rect(page.mediabox))
+                applied += 1
+            except Exception as exc:
+                print(f"[reset-crop] page {idx}: {exc}", file=sys.stderr)
+        self.view.render_all(preserve_scroll=True)
+        self._mark_dirty()
+        self._refresh_thumbnails_panel()
+        return applied
 
     # --- Find ---
     def _on_find_case_toggled(self, _checked: bool):
