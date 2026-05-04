@@ -1701,6 +1701,149 @@ class WatermarkDialog(QDialog):
         }
 
 
+class BatesNumberingDialog(QDialog):
+    """Configure Bates stamping — prefix, suffix, padding, position, color, range."""
+
+    POSITIONS = [
+        ("Bottom Right", "bottom-right"),
+        ("Bottom Left", "bottom-left"),
+        ("Bottom Center", "bottom-center"),
+        ("Top Right", "top-right"),
+        ("Top Left", "top-left"),
+        ("Top Center", "top-center"),
+    ]
+
+    def __init__(self, parent=None, page_count: int = 1):
+        super().__init__(parent)
+        self.setWindowTitle("Bates Numbering")
+        self.setMinimumWidth(420)
+        self._page_count = page_count
+
+        self.prefix_edit = QLineEdit("")
+        self.prefix_edit.setPlaceholderText("e.g. ACME")
+        self.suffix_edit = QLineEdit("")
+        self.suffix_edit.setPlaceholderText("e.g. -DOC")
+
+        self.start_box = QSpinBox()
+        self.start_box.setRange(1, 9999999)
+        self.start_box.setValue(1)
+
+        self.padding_box = QSpinBox()
+        self.padding_box.setRange(0, 12)
+        self.padding_box.setValue(6)
+
+        self.position_box = QComboBox()
+        for label, _ in self.POSITIONS:
+            self.position_box.addItem(label)
+
+        self.size_box = QSpinBox()
+        self.size_box.setRange(6, 24)
+        self.size_box.setValue(10)
+
+        self.color = QColor(0, 0, 0)
+        self.color_btn = QPushButton(self.color.name())
+        self.color_btn.clicked.connect(self._pick_color)
+        self._update_color_btn()
+
+        self.apply_box = QComboBox()
+        self.apply_box.addItem("All pages")
+        self.apply_box.addItem("Page range")
+        self.range_edit = QLineEdit()
+        self.range_edit.setPlaceholderText(f"e.g. 1,3-5  (1–{page_count})")
+        self.range_edit.setEnabled(False)
+        self.apply_box.currentIndexChanged.connect(
+            lambda i: self.range_edit.setEnabled(i == 1)
+        )
+
+        self.preview = QLabel()
+        self.preview.setMinimumHeight(40)
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview.setStyleSheet(
+            "border:1px solid palette(mid); background:palette(base);"
+        )
+        self.preview_update_count = 0
+
+        self.note = QLabel(
+            "Tip: save a backup before applying — Bates is permanent on save."
+        )
+        self.note.setWordWrap(True)
+        self.note.setStyleSheet("color: palette(mid);")
+
+        self.prefix_edit.textChanged.connect(self._update_preview)
+        self.suffix_edit.textChanged.connect(self._update_preview)
+        self.start_box.valueChanged.connect(self._update_preview)
+        self.padding_box.valueChanged.connect(self._update_preview)
+        self.size_box.valueChanged.connect(self._update_preview)
+        self.position_box.currentIndexChanged.connect(self._update_preview)
+
+        form = QFormLayout()
+        form.addRow("Prefix:", self.prefix_edit)
+        form.addRow("Suffix:", self.suffix_edit)
+        form.addRow("Start number:", self.start_box)
+        form.addRow("Number padding:", self.padding_box)
+        form.addRow("Position:", self.position_box)
+        form.addRow("Font size:", self.size_box)
+        form.addRow("Font color:", self.color_btn)
+        form.addRow("Apply to:", self.apply_box)
+        form.addRow("Pages:", self.range_edit)
+        form.addRow("Preview:", self.preview)
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(self.note)
+        layout.addWidget(bb)
+
+        self._update_preview()
+
+    @staticmethod
+    def format_bates(prefix: str, n: int, padding: int, suffix: str) -> str:
+        return f"{prefix}{n:0{padding}d}{suffix}"
+
+    def _update_preview(self):
+        sample = self.format_bates(
+            self.prefix_edit.text(),
+            int(self.start_box.value()),
+            int(self.padding_box.value()),
+            self.suffix_edit.text(),
+        )
+        self.preview.setText(f"Sample: {sample}")
+        self.preview_update_count += 1
+
+    def _pick_color(self):
+        c = QColorDialog.getColor(self.color, self, "Bates Color")
+        if c.isValid():
+            self.color = c
+            self._update_color_btn()
+            self._update_preview()
+
+    def _update_color_btn(self):
+        self.color_btn.setText(self.color.name())
+        self.color_btn.setStyleSheet(
+            f"background:{self.color.name()};"
+            f"color:{'white' if self.color.lightness() < 128 else 'black'};"
+        )
+
+    def values(self) -> dict:
+        _, position = self.POSITIONS[self.position_box.currentIndex()]
+        return {
+            "prefix": self.prefix_edit.text(),
+            "suffix": self.suffix_edit.text(),
+            "start": int(self.start_box.value()),
+            "padding": int(self.padding_box.value()),
+            "position": position,
+            "size": int(self.size_box.value()),
+            "color": self.color,
+            "all_pages": self.apply_box.currentIndex() == 0,
+            "range": self.range_edit.text(),
+        }
+
+
 class OCRDialog(QDialog):
     """Configure a Tesseract OCR pass — page range, language, skip, output mode."""
 
@@ -7697,6 +7840,7 @@ class MainWindow(QMainWindow):
                 "Tesseract OCR not available — " + reason
                 + ". Click for install instructions."
             )
+        self.act_bates = make("Bates Numbering…", self.open_bates_dialog)
 
         # Forms (one-shot)
         self.act_tab_order = make("Tab Order…", self.open_tab_order_dialog)
@@ -8007,7 +8151,8 @@ class MainWindow(QMainWindow):
                          self._crop_tool_action(), self.act_reset_crop]),
             ("&Forms", [*self._form_actions, None, self.act_tab_order,
                         None, self.act_reset_form, self.act_flatten_form]),
-            ("&Tools", [self.act_watermark, self.act_protect, self.act_ocr]),
+            ("&Tools", [self.act_watermark, self.act_protect, self.act_ocr,
+                        self.act_bates]),
         ]
         self._menu_spec = menu_spec
 
@@ -8986,6 +9131,95 @@ class MainWindow(QMainWindow):
             )
         self.statusBar().showMessage(
             f"Applied watermark to {applied} page(s)"
+        )
+
+    # ---------------- Bates Numbering ----------------
+    def open_bates_dialog(self, *, options: dict | None = None):
+        if not self.view.doc:
+            return
+        page_count = len(self.view.doc)
+        if options is None:
+            dlg = BatesNumberingDialog(self, page_count=page_count)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            options = dlg.values()
+        prefix = options.get("prefix", "") or ""
+        suffix = options.get("suffix", "") or ""
+        if not prefix and not suffix:
+            reply = QMessageBox.question(
+                self, "Bates Numbering",
+                "Empty prefix + suffix would just stamp numbers — proceed?",
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        start = int(options.get("start", 1))
+        padding = int(options.get("padding", 6))
+        position = options.get("position", "bottom-right")
+        size = int(options.get("size", 10))
+        color_obj = options.get("color", QColor(0, 0, 0))
+        rgb = (color_obj.redF(), color_obj.greenF(), color_obj.blueF())
+        if options.get("all_pages", True):
+            indices = list(range(page_count))
+        else:
+            try:
+                indices, warnings = parse_page_range(
+                    options.get("range", ""), page_count
+                )
+            except ValueError as exc:
+                QMessageBox.warning(self, "Bates Numbering", f"Bad page range: {exc}")
+                return
+            if warnings:
+                QMessageBox.warning(
+                    self, "Bates Numbering",
+                    "Page range had issues:\n\n" + "\n".join(f"  • {w}" for w in warnings),
+                )
+            if not indices:
+                QMessageBox.warning(self, "Bates Numbering", "No pages selected.")
+                return
+
+        self._snapshot()
+        applied = 0
+        failures: list[str] = []
+        inset = 24.0
+        for stamp_idx, page_i in enumerate(indices):
+            page = self.view.doc[page_i]
+            n = start + stamp_idx
+            text = BatesNumberingDialog.format_bates(prefix, n, padding, suffix)
+            try:
+                tw = fitz.get_text_length(text, fontname="helv", fontsize=size)
+            except Exception:
+                tw = len(text) * size * 0.55
+            page_w = page.rect.width
+            page_h = page.rect.height
+            if position.endswith("-center"):
+                x = (page_w - tw) / 2
+            elif position.endswith("-left"):
+                x = inset
+            else:
+                x = page_w - tw - inset
+            if position.startswith("top-"):
+                y = inset + size
+            else:
+                y = page_h - inset
+            try:
+                page.insert_text(
+                    (x, y), text, fontname="helv", fontsize=size, color=rgb,
+                )
+                applied += 1
+            except Exception as exc:
+                failures.append(f"page {page_i + 1}: {exc}")
+        self.view.render_all(preserve_scroll=True)
+        self._mark_dirty()
+        if failures:
+            body = "\n".join(f"  • {f}" for f in failures)
+            QMessageBox.warning(
+                self, "Bates Numbering",
+                f"Bates applied to {applied} page(s).\n\n"
+                f"{len(failures)} page(s) failed:\n\n{body}",
+            )
+        self.statusBar().showMessage(
+            f"Applied Bates numbering to {applied} page(s) — "
+            "save a backup, Bates is permanent on save."
         )
 
     # ---------------- Recognize Text (OCR) ----------------
