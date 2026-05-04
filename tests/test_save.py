@@ -24,23 +24,34 @@ def test_save_pdf_atomic_temp_cleanup(main_window, tmp_path):
 
 
 def test_save_pdf_partial_bake_warning(main_window, tmp_path, monkeypatch):
-    """If a single overlay fails to bake, _report_bake_failures must warn."""
+    """If SOME overlays fail to bake (but not all), _report_bake_failures must warn."""
     win = main_window
     install_doc(win, make_blank_doc())
 
-    # Add a textbox that will raise on to_pdf().
-    box = pdfedit.TextBoxItem(
+    # Two overlays: only the first will fail. The second succeeds → "partial".
+    box_fail = pdfedit.TextBoxItem(
         win.view, page_idx=0, pdf_x=72, pdf_y=72, pdf_w=400,
         text="will-fail", family="Helvetica", size_pt=18,
     )
-    win.view.overlays.append(box)
-    win.view.scene_.addItem(box)
-    box.refresh()
+    win.view.overlays.append(box_fail)
+    win.view.scene_.addItem(box_fail)
+    box_fail.refresh()
+    box_ok = pdfedit.TextBoxItem(
+        win.view, page_idx=0, pdf_x=72, pdf_y=200, pdf_w=400,
+        text="will-succeed", family="Helvetica", size_pt=18,
+    )
+    win.view.overlays.append(box_ok)
+    win.view.scene_.addItem(box_ok)
+    box_ok.refresh()
 
-    def boom(self, page):
-        raise RuntimeError("synthetic bake failure")
+    real_to_pdf = pdfedit.TextBoxItem.to_pdf
 
-    monkeypatch.setattr(pdfedit.TextBoxItem, "to_pdf", boom)
+    def maybe_boom(self, page):
+        if "will-fail" in self.toPlainText():
+            raise RuntimeError("synthetic bake failure")
+        return real_to_pdf(self, page)
+
+    monkeypatch.setattr(pdfedit.TextBoxItem, "to_pdf", maybe_boom)
 
     seen = {}
 

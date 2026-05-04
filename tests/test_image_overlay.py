@@ -194,7 +194,12 @@ def test_image_overlay_resize_undo_restores(main_window, monkeypatch, png_path):
 def test_image_overlay_display_name_for_bake_failure(
     main_window, monkeypatch, png_path, tmp_path
 ):
-    """Bake-failure label uses the ImageOverlayItem DISPLAY_NAME ('Image')."""
+    """Bake-failure label uses the ImageOverlayItem DISPLAY_NAME ('Image').
+
+    With only one overlay and that overlay's bake failing, _save_clone_atomic
+    refuses the save and surfaces a QMessageBox.critical "Save aborted" — the
+    label "Image" still has to appear in the body.
+    """
     win = main_window
     install_doc(win, make_blank_doc())
     _patch_file_dialog(monkeypatch, png_path)
@@ -207,10 +212,11 @@ def test_image_overlay_display_name_for_bake_failure(
 
     seen: dict[str, str] = {}
 
-    def fake_warning(parent, title, body, *a, **kw):
+    def fake_critical(parent, title, body, *a, **kw):
+        seen["title"] = title
         seen["body"] = body
 
-    monkeypatch.setattr(pdfedit.QMessageBox, "warning", staticmethod(fake_warning))
+    monkeypatch.setattr(pdfedit.QMessageBox, "critical", staticmethod(fake_critical))
 
     out = tmp_path / "imgfail.pdf"
     win.path = str(out)
