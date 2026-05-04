@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 from urllib.parse import quote, urlparse
@@ -45,6 +46,7 @@ from PyQt6.QtWidgets import (
     QAbstractItemView,
     QAbstractSpinBox,
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QColorDialog,
     QComboBox,
@@ -73,6 +75,7 @@ from PyQt6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPlainTextEdit,
+    QProgressDialog,
     QPushButton,
     QRadioButton,
     QSlider,
@@ -356,6 +359,108 @@ def parse_page_range(
                 continue
             seen.add(p - 1)
     return sorted(seen), warnings
+
+
+def parse_split_ranges(
+    spec: str, max_pages: int
+) -> tuple[list[tuple[int, int]], list[str]]:
+    """Parse a split-ranges spec like "1-3, 5, 7-9" into per-segment chunks.
+
+    Returns ``(chunks, warnings)`` where each chunk is an inclusive 0-based
+    ``(start, end)`` tuple. Single-page entries become ``(p, p)``. Open-ended
+    forms ("1-", "-3") are accepted. Overlapping chunks are detected and
+    surfaced as a warning string ``"overlapping ranges"`` so callers can
+    reject the input. Out-of-range / malformed segments add warnings; an
+    entirely-invalid segment raises ``ValueError`` like ``parse_page_range``.
+    """
+    s = (spec or "").strip()
+    warnings: list[str] = []
+    if not s:
+        return [], warnings
+    chunks: list[tuple[int, int]] = []
+    seen: set[int] = set()
+    overlap = False
+    for raw in s.split(","):
+        seg = raw.strip()
+        if not seg:
+            continue
+        if "-" in seg:
+            a_str, b_str = seg.split("-", 1)
+            a_str = a_str.strip()
+            b_str = b_str.strip()
+            if not a_str and not b_str:
+                raise ValueError(f"Invalid page range segment: {seg!r}")
+            try:
+                a = int(a_str) if a_str else 1
+                b = int(b_str) if b_str else max_pages
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid page range segment: {seg!r}"
+                ) from exc
+            if a > b:
+                a, b = b, a
+            if b > max_pages:
+                warnings.append(
+                    f"range {seg!r} exceeds document length "
+                    f"({max_pages} pages)"
+                )
+                b = max_pages
+            if a < 1:
+                warnings.append(f"range {seg!r} starts below page 1")
+                a = 1
+            if a > max_pages or b < 1:
+                continue
+            start, end = a - 1, b - 1
+        else:
+            try:
+                p = int(seg)
+            except ValueError as exc:
+                raise ValueError(f"Invalid page number: {seg!r}") from exc
+            if p == 0:
+                warnings.append("page 0 is not valid (pages are 1-based)")
+                continue
+            if p < 0:
+                warnings.append(f"negative page {p} ignored")
+                continue
+            if p > max_pages:
+                warnings.append(
+                    f"page {p} exceeds document length ({max_pages} pages)"
+                )
+                continue
+            start, end = p - 1, p - 1
+        for idx in range(start, end + 1):
+            if idx in seen:
+                overlap = True
+            seen.add(idx)
+        chunks.append((start, end))
+    if overlap:
+        warnings.append("overlapping ranges")
+    return chunks, warnings
+
+
+_FILENAME_ILLEGAL_RE = re.compile(r'[\\/:*?"<>|]')
+
+
+def sanitize_filename(name: str) -> str:
+    """Strip filesystem-illegal characters; collapse whitespace; trim."""
+    cleaned = _FILENAME_ILLEGAL_RE.sub("", name or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned or "untitled"
+
+
+def open_folder_in_file_manager(folder: str) -> bool:
+    """Reveal `folder` in the OS file manager. Returns True on launch."""
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", folder])
+        elif sys.platform.startswith("win"):
+            os.startfile(folder)  # type: ignore[attr-defined]
+        else:
+            subprocess.Popen(["xdg-open", folder])
+        return True
+    except Exception as exc:
+        print(f"[open_folder] failed: {exc}", file=sys.stderr)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1662,6 +1767,237 @@ class NewPDFDialog(QDialog):
             self.height_in.value() * 72.0,
             self.pages.value(),
         )
+
+
+class SplitPdfDialog(QDialog):
+    """Configure splitting the open PDF into multiple files."""
+
+    MODE_RANGES = "ranges"
+    MODE_EVERY_N = "every_n"
+    MODE_BOOKMARKS = "bookmarks"
+
+    DEFAULT_TEMPLATE = "{stem}_part_{n}.pdf"
+
+    def __init__(
+        self,
+        parent=None,
+        *,
+        page_count: int = 1,
+        toc: list | None = None,
+        source_path: str | None = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Split PDF")
+        self.setMinimumWidth(460)
+
+        self._page_count = max(1, int(page_count))
+        self._toc = list(toc or [])
+        self._top_bookmarks = [t for t in self._toc if t and t[0] == 1]
+        self._source_path = source_path
+
+        default_dir = os.path.dirname(source_path) if source_path else os.getcwd()
+        self._output_folder = default_dir or os.getcwd()
+        self._stem = (
+            os.path.splitext(os.path.basename(source_path))[0]
+            if source_path else "document"
+        )
+
+        self.rb_ranges = QRadioButton("By page ranges")
+        self.rb_every = QRadioButton("Every N pages")
+        self.rb_bookmarks = QRadioButton("By top-level bookmarks")
+        self.rb_ranges.setChecked(True)
+
+        self._mode_group = QButtonGroup(self)
+        self._mode_group.addButton(self.rb_ranges, 0)
+        self._mode_group.addButton(self.rb_every, 1)
+        self._mode_group.addButton(self.rb_bookmarks, 2)
+
+        self.range_edit = QLineEdit()
+        self.range_edit.setPlaceholderText(
+            f"e.g. 1-3, 5, 7-{self._page_count}"
+        )
+
+        self.every_n = QSpinBox()
+        self.every_n.setRange(1, 1000)
+        self.every_n.setValue(min(10, self._page_count))
+
+        self.bookmark_hint = QLabel("(no bookmarks in this document)")
+        self.bookmark_hint.setStyleSheet("color: #888;")
+        if self._top_bookmarks:
+            self.bookmark_hint.setText(
+                f"{len(self._top_bookmarks)} top-level bookmark(s) detected"
+            )
+        else:
+            self.rb_bookmarks.setEnabled(False)
+
+        self.folder_label = QLabel(self._output_folder)
+        self.folder_label.setWordWrap(True)
+        self.choose_btn = QPushButton("Choose…")
+        self.choose_btn.clicked.connect(self._choose_folder)
+
+        self.template_edit = QLineEdit(self.DEFAULT_TEMPLATE)
+
+        self.open_when_done = QCheckBox("Open output folder when done")
+        self.open_when_done.setChecked(True)
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.button(QDialogButtonBox.StandardButton.Ok).setText("Split")
+        bb.button(QDialogButtonBox.StandardButton.Cancel).setText("Cancel")
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+
+        mode_box = QGroupBox("Mode")
+        mode_layout = QVBoxLayout(mode_box)
+        mode_layout.addWidget(self.rb_ranges)
+        ranges_row = QHBoxLayout()
+        ranges_row.addSpacing(20)
+        ranges_row.addWidget(QLabel("Ranges:"))
+        ranges_row.addWidget(self.range_edit, 1)
+        mode_layout.addLayout(ranges_row)
+        mode_layout.addWidget(self.rb_every)
+        every_row = QHBoxLayout()
+        every_row.addSpacing(20)
+        every_row.addWidget(QLabel("N:"))
+        every_row.addWidget(self.every_n)
+        every_row.addStretch(1)
+        mode_layout.addLayout(every_row)
+        mode_layout.addWidget(self.rb_bookmarks)
+        bm_row = QHBoxLayout()
+        bm_row.addSpacing(20)
+        bm_row.addWidget(self.bookmark_hint)
+        bm_row.addStretch(1)
+        mode_layout.addLayout(bm_row)
+
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(self.choose_btn)
+        folder_row.addWidget(self.folder_label, 1)
+
+        form = QFormLayout()
+        form.addRow("Output folder:", folder_row)
+        form.addRow("Filename:", self.template_edit)
+
+        tokens = QLabel(
+            "Tokens: {stem}, {n}, {first}, {last}, {title}"
+        )
+        tokens.setStyleSheet("color: #888; font-size: 11px;")
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(mode_box)
+        layout.addLayout(form)
+        layout.addWidget(tokens)
+        layout.addWidget(self.open_when_done)
+        layout.addWidget(bb)
+
+    # ----- programmatic API (used by tests) -----------------------------
+    def set_mode(self, mode: str) -> None:
+        if mode == self.MODE_RANGES:
+            self.rb_ranges.setChecked(True)
+        elif mode == self.MODE_EVERY_N:
+            self.rb_every.setChecked(True)
+        elif mode == self.MODE_BOOKMARKS:
+            if not self.rb_bookmarks.isEnabled():
+                raise ValueError("bookmark mode disabled (no bookmarks)")
+            self.rb_bookmarks.setChecked(True)
+        else:
+            raise ValueError(f"unknown mode: {mode!r}")
+
+    def mode(self) -> str:
+        if self.rb_every.isChecked():
+            return self.MODE_EVERY_N
+        if self.rb_bookmarks.isChecked():
+            return self.MODE_BOOKMARKS
+        return self.MODE_RANGES
+
+    def set_range_text(self, text: str) -> None:
+        self.range_edit.setText(text)
+
+    def set_every_n(self, n: int) -> None:
+        self.every_n.setValue(int(n))
+
+    def set_output_folder(self, folder: str) -> None:
+        self._output_folder = folder
+        self.folder_label.setText(folder)
+
+    def output_folder(self) -> str:
+        return self._output_folder
+
+    def set_filename_template(self, tmpl: str) -> None:
+        self.template_edit.setText(tmpl)
+
+    def filename_template(self) -> str:
+        return self.template_edit.text().strip() or self.DEFAULT_TEMPLATE
+
+    # ----- chunk + filename construction --------------------------------
+    def _collect_chunks(self) -> tuple[list[tuple[int, int, str]], list[str]]:
+        """Return ``(chunks, warnings)``.
+
+        Each chunk is ``(start, end, title)`` — inclusive 0-based page
+        indices and a title (empty unless bookmark mode). Warnings are
+        human-readable; an entry of ``"overlapping ranges"`` means the
+        caller should reject the input.
+        """
+        mode = self.mode()
+        warnings: list[str] = []
+        if mode == self.MODE_RANGES:
+            text = self.range_edit.text().strip()
+            chunks_pp, warnings = parse_split_ranges(text, self._page_count)
+            return [(s, e, "") for s, e in chunks_pp], warnings
+        if mode == self.MODE_EVERY_N:
+            n = max(1, int(self.every_n.value()))
+            chunks: list[tuple[int, int, str]] = []
+            for start in range(0, self._page_count, n):
+                end = min(start + n - 1, self._page_count - 1)
+                chunks.append((start, end, ""))
+            return chunks, warnings
+        if mode == self.MODE_BOOKMARKS:
+            entries = self._top_bookmarks
+            if not entries:
+                return [], ["no top-level bookmarks"]
+            chunks = []
+            for i, entry in enumerate(entries):
+                _, title, page = entry[0], entry[1], entry[2]
+                start = max(0, int(page) - 1)
+                if i + 1 < len(entries):
+                    next_page = max(0, int(entries[i + 1][2]) - 1)
+                    end = max(start, next_page - 1)
+                else:
+                    end = self._page_count - 1
+                if start >= self._page_count:
+                    warnings.append(
+                        f"bookmark {title!r} starts past end of doc"
+                    )
+                    continue
+                end = min(end, self._page_count - 1)
+                chunks.append((start, end, title or ""))
+            return chunks, warnings
+        return [], ["unknown mode"]
+
+    def _format_filename(
+        self, *, n: int, first: int, last: int, title: str
+    ) -> str:
+        tmpl = self.filename_template()
+        safe_title = sanitize_filename(title) if title else ""
+        out = (
+            tmpl
+            .replace("{stem}", self._stem)
+            .replace("{n}", str(n))
+            .replace("{first}", str(first))
+            .replace("{last}", str(last))
+            .replace("{title}", safe_title)
+        )
+        if not out.lower().endswith(".pdf"):
+            out += ".pdf"
+        return out
+
+    def _choose_folder(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(
+            self, "Choose output folder", self._output_folder
+        )
+        if chosen:
+            self.set_output_folder(chosen)
 
 
 CURSIVE_FONTS = ["Dancing Script", "Pacifico", "Caveat", "Permanent Marker",
@@ -5356,6 +5692,7 @@ class MainWindow(QMainWindow):
         self.act_save_as = make("Save As…", self.save_pdf_as, "Ctrl+Shift+S")
         self.act_merge = make("Merge PDF…", self.merge_pdfs)
         self.act_extract = make("Extract Pages…", self.extract_pages_dialog)
+        self.act_split = make("Split…", self.open_split_dialog)
         self.act_preferences = make("Preferences…", self.open_settings_dialog, "Ctrl+,")
         self.act_preferences.setMenuRole(QAction.MenuRole.PreferencesRole)
 
@@ -5630,7 +5967,7 @@ class MainWindow(QMainWindow):
         menu_spec: list[tuple[str, list]] = [
             ("&File", [self.act_new, self.act_open, self.recent_menu, None,
                        self.act_save, self.act_save_as, None,
-                       self.act_merge, self.act_extract, None,
+                       self.act_merge, self.act_extract, self.act_split, None,
                        self.act_preferences]),
             ("&Edit", [self.act_undo, self.act_redo, None,
                        self.act_find, self.act_find_next, self.act_find_prev,
@@ -6704,6 +7041,191 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Extracted {len(indices)} page(s) to {out}"
         )
+
+    def open_split_dialog(self):
+        if not self.view.doc:
+            QMessageBox.information(
+                self, "Split PDF", "Open or create a PDF first to split."
+            )
+            return
+        page_count = len(self.view.doc)
+        try:
+            toc = self.view.doc.get_toc(simple=True) or []
+        except Exception:
+            toc = []
+        dlg = SplitPdfDialog(
+            self,
+            page_count=page_count,
+            toc=toc,
+            source_path=self.path,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._run_split(dlg)
+
+    def _run_split(self, dlg: "SplitPdfDialog") -> None:
+        chunks, warnings = dlg._collect_chunks()
+        if "overlapping ranges" in warnings:
+            QMessageBox.warning(
+                self, "Split PDF",
+                "Overlapping page ranges are not allowed. "
+                "Please make each range distinct.",
+            )
+            return
+        non_overlap_warnings = [w for w in warnings if w != "overlapping ranges"]
+        if non_overlap_warnings:
+            QMessageBox.warning(
+                self, "Split PDF",
+                "Page range had issues:\n\n"
+                + "\n".join(f"  • {w}" for w in non_overlap_warnings),
+            )
+        if not chunks:
+            QMessageBox.warning(
+                self, "Split PDF", "No output files would be produced."
+            )
+            return
+        folder = dlg.output_folder()
+        if not folder or not os.path.isdir(folder):
+            QMessageBox.warning(
+                self, "Split PDF",
+                f"Output folder does not exist:\n{folder}",
+            )
+            return
+        if not os.access(folder, os.W_OK):
+            QMessageBox.warning(
+                self, "Split PDF",
+                f"Output folder is not writable:\n{folder}",
+            )
+            return
+
+        planned: list[tuple[int, int, str, str]] = []
+        used_names: set[str] = set()
+        for i, (start, end, title) in enumerate(chunks, start=1):
+            name = dlg._format_filename(
+                n=i, first=start + 1, last=end + 1, title=title
+            )
+            if name in used_names:
+                base, ext = os.path.splitext(name)
+                k = 2
+                while f"{base}_{k}{ext}" in used_names:
+                    k += 1
+                name = f"{base}_{k}{ext}"
+            used_names.add(name)
+            planned.append((start, end, title, name))
+
+        overwrite_all = False
+        skip_all = False
+        final_plan: list[tuple[int, int, str, str]] = []
+        for start, end, title, name in planned:
+            full = os.path.join(folder, name)
+            if os.path.exists(full) and not overwrite_all:
+                if skip_all:
+                    continue
+                btns = (
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.YesToAll
+                    | QMessageBox.StandardButton.No
+                    | QMessageBox.StandardButton.Cancel
+                )
+                resp = QMessageBox.question(
+                    self, "File exists",
+                    f"File already exists:\n{full}\n\nOverwrite?",
+                    btns,
+                )
+                if resp == QMessageBox.StandardButton.YesToAll:
+                    overwrite_all = True
+                elif resp == QMessageBox.StandardButton.No:
+                    skip_all = True
+                    continue
+                elif resp == QMessageBox.StandardButton.Cancel:
+                    return
+            final_plan.append((start, end, title, name))
+
+        if not final_plan:
+            QMessageBox.warning(
+                self, "Split PDF", "No files written (all skipped)."
+            )
+            return
+
+        progress = QProgressDialog(
+            "Splitting PDF…", "Cancel", 0, len(final_plan), self
+        )
+        progress.setWindowTitle("Split PDF")
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        QApplication.processEvents()
+
+        baked, failed = self._bake_to_clone()
+        try:
+            written, errors, cancelled = self._perform_split(
+                baked, folder, final_plan, progress
+            )
+        finally:
+            try:
+                baked.close()
+            except Exception:
+                pass
+            progress.close()
+
+        if failed:
+            self._report_bake_failures(failed)
+
+        if cancelled:
+            QMessageBox.information(
+                self, "Split PDF",
+                f"Cancelled. {written} file(s) were written before cancel "
+                f"to:\n{folder}",
+            )
+        elif errors:
+            body = "\n".join(f"  • {e}" for e in errors)
+            QMessageBox.warning(
+                self, "Split PDF",
+                f"Wrote {written} file(s) to {folder}.\n\n"
+                f"{len(errors)} error(s):\n\n{body}",
+            )
+        else:
+            QMessageBox.information(
+                self, "Split PDF",
+                f"Created {written} file(s) in {folder}",
+            )
+
+        self.statusBar().showMessage(
+            f"Split: wrote {written} file(s) to {folder}"
+        )
+
+        if dlg.open_when_done.isChecked() and written > 0:
+            open_folder_in_file_manager(folder)
+
+    def _perform_split(
+        self, baked, folder: str,
+        plan: list[tuple[int, int, str, str]],
+        progress: "QProgressDialog | None",
+    ) -> tuple[int, list[str], bool]:
+        """Write each chunk in `plan` to `folder`. Returns (written, errors, cancelled)."""
+        written = 0
+        errors: list[str] = []
+        cancelled = False
+        for idx, (start, end, _title, name) in enumerate(plan):
+            if progress is not None and progress.wasCanceled():
+                cancelled = True
+                break
+            full = os.path.join(folder, name)
+            out = fitz.open()
+            try:
+                out.insert_pdf(baked, from_page=start, to_page=end)
+                out.save(full, garbage=4, deflate=True)
+                written += 1
+            except Exception as exc:
+                errors.append(f"{name}: {exc}")
+            finally:
+                try:
+                    out.close()
+                except Exception:
+                    pass
+            if progress is not None:
+                progress.setValue(idx + 1)
+                QApplication.processEvents()
+        return written, errors, cancelled
 
     def do_erase(self, page_idx: int, x0, y0, x1, y1):
         if x1 - x0 < 2 or y1 - y0 < 2:
