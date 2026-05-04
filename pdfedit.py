@@ -2941,6 +2941,8 @@ class PDFView(QGraphicsView):
                 if i != self.page_idx:
                     self.page_idx = i
                     self.window_._refresh_page_label()
+                    if hasattr(self.window_, "_refresh_thumbnails_active"):
+                        self.window_._refresh_thumbnails_active()
                 return
 
     def _locate(self, scene_pt: QPointF) -> tuple[int, float, float] | None:
@@ -4201,6 +4203,487 @@ def _field_type_display(widget: "fitz.Widget") -> tuple[str, str]:
     return _FIELD_TYPE_LABELS.get(ft, ("?", "Unknown"))
 
 
+PAGE_THUMBNAILS_PANEL_VISIBLE_KEY = "pageThumbnailsPanelVisible"
+THUMBNAIL_TARGET_WIDTH = 150
+
+
+class _PageThumbnailsList(QListWidget):
+    """QListWidget subclass that signals its parent panel after a drop reorder."""
+
+    def __init__(self, panel: "PageThumbnailsPanel"):
+        super().__init__()
+        self._panel = panel
+
+    def dropEvent(self, ev):
+        super().dropEvent(ev)
+        QTimer.singleShot(0, self._panel._on_drop_finished)
+
+
+class PageThumbnailsPanel(QDockWidget):
+    """Adobe-Acrobat-style "Pages" side panel.
+
+    Renders each page in the active doc as a thumbnail in a vertically
+    scrolling QListWidget. Click jumps the main view to that page; drag-drop
+    reorders pages; right-click exposes rotate/insert/delete/extract actions.
+    """
+
+    PAGE_ROLE = Qt.ItemDataRole.UserRole + 1
+    XREF_ROLE = Qt.ItemDataRole.UserRole + 2
+
+    def __init__(self, window: "MainWindow"):
+        super().__init__("Page Thumbnails", window)
+        self.window_ = window
+        self.setObjectName("PageThumbnailsPanel")
+        self.setAllowedAreas(
+            Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
+        )
+
+        body = QWidget(self)
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        title = QLabel("Page Thumbnails")
+        f = title.font()
+        f.setBold(True)
+        title.setFont(f)
+        header.addWidget(title)
+        header.addStretch()
+        self.refresh_btn = QToolButton(body)
+        self.refresh_btn.setText("Refresh")
+        self.refresh_btn.setAutoRaise(True)
+        self.refresh_btn.clicked.connect(self.refresh)
+        header.addWidget(self.refresh_btn)
+        layout.addLayout(header)
+
+        self.stack = QStackedWidget(body)
+        layout.addWidget(self.stack, 1)
+
+        self.list_widget = _PageThumbnailsList(self)
+        self.list_widget.setViewMode(QListWidget.ViewMode.IconMode)
+        self.list_widget.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.list_widget.setMovement(QListWidget.Movement.Snap)
+        self.list_widget.setWrapping(True)
+        self.list_widget.setUniformItemSizes(False)
+        self.list_widget.setSpacing(8)
+        self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.list_widget.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.list_widget.setDragEnabled(True)
+        self.list_widget.setAcceptDrops(True)
+        self.list_widget.setDropIndicatorShown(True)
+        self.list_widget.setIconSize(_qsize_for_thumb())
+        self.list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list_widget.customContextMenuRequested.connect(self._on_context_menu)
+        self.list_widget.itemClicked.connect(self._on_item_clicked)
+        self.list_widget.currentItemChanged.connect(self._on_current_item_changed)
+        self.stack.addWidget(self.list_widget)
+
+        self.empty_label = QLabel("Open a PDF to see page thumbnails.")
+        self.empty_label.setWordWrap(True)
+        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_label.setContentsMargins(8, 8, 8, 8)
+        self.stack.addWidget(self.empty_label)
+
+        self.status_label = QLabel("0 pages")
+        sf = self.status_label.font()
+        sf.setPointSize(max(8, sf.pointSize() - 1))
+        self.status_label.setFont(sf)
+        layout.addWidget(self.status_label)
+
+        self.setWidget(body)
+
+        self._cache: dict[tuple, QPixmap] = {}
+        self._suspend_refresh = False
+        self._suspend_drop = False
+        self._needs_refresh = False
+        self.refresh()
+
+    def sizeHint(self):
+        from PyQt6.QtCore import QSize
+        return QSize(200, 600)
+
+    # --- public API ---
+    def refresh(self) -> None:
+        if self._suspend_refresh:
+            return
+        self._suspend_refresh = True
+        try:
+            self.list_widget.clear()
+            try:
+                doc = self.window_.view.doc if hasattr(self.window_, "view") else None
+            except RuntimeError:
+                return
+            if not doc or len(doc) == 0:
+                self.stack.setCurrentWidget(self.empty_label)
+                self.status_label.setText("0 pages")
+                return
+            self.stack.setCurrentWidget(self.list_widget)
+            n = len(doc)
+            for i in range(n):
+                item = QListWidgetItem()
+                item.setText(f"Page {i + 1}")
+                item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom)
+                item.setData(self.PAGE_ROLE, i)
+                try:
+                    item.setData(self.XREF_ROLE, doc[i].xref)
+                except Exception:
+                    item.setData(self.XREF_ROLE, 0)
+                pm = self._render_thumbnail(i)
+                if pm is not None:
+                    item.setIcon(self._icon_from_pixmap(pm))
+                    item.setSizeHint(self._size_hint_for(pm))
+                item.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsDragEnabled
+                )
+                self.list_widget.addItem(item)
+            self.status_label.setText(f"{n} page{'s' if n != 1 else ''}")
+            self._update_current_highlight()
+        finally:
+            self._suspend_refresh = False
+
+    def select_page(self, idx: int) -> None:
+        if idx < 0 or idx >= self.list_widget.count():
+            return
+        self.list_widget.blockSignals(True)
+        self.list_widget.setCurrentRow(idx)
+        self.list_widget.blockSignals(False)
+        if self.window_.view.doc and 0 <= idx < len(self.window_.view.doc):
+            self.window_.view.scroll_to_page(idx)
+            self.window_._refresh_page_label()
+        self._update_current_highlight()
+
+    def current_page_index(self) -> int:
+        item = self.list_widget.currentItem()
+        if item is None:
+            return -1
+        v = item.data(self.PAGE_ROLE)
+        return int(v) if v is not None else -1
+
+    def commit_reorder(self, new_order: "list[int] | None" = None) -> None:
+        """Apply a reorder using `new_order` if given, else the current item order.
+
+        `new_order[k]` is the original page index that should land at position k.
+        """
+        doc = self.window_.view.doc
+        if doc is None:
+            return
+        n = len(doc)
+        if new_order is None:
+            new_order = []
+            for i in range(self.list_widget.count()):
+                v = self.list_widget.item(i).data(self.PAGE_ROLE)
+                new_order.append(int(v) if v is not None else 0)
+        if len(new_order) != n or sorted(new_order) != list(range(n)):
+            self.refresh()
+            return
+        if new_order == list(range(n)):
+            return
+        self.window_._snapshot()
+        try:
+            try:
+                doc.select(list(new_order))
+            except Exception:
+                self.window_._undo.pop() if self.window_._undo else None
+                raise
+            inv = [0] * n
+            for new_pos, old_idx in enumerate(new_order):
+                inv[old_idx] = new_pos
+            for ov in self.window_.view.overlays:
+                if 0 <= ov.page_idx < n:
+                    ov.page_idx = inv[ov.page_idx]
+        except Exception as exc:
+            QMessageBox.warning(self, "Reorder", f"Could not reorder pages: {exc}")
+            return
+        self._cache.clear()
+        self.window_.view.render_all()
+        self.window_._mark_dirty()
+        self.window_._refresh_page_label()
+        self.window_._refresh_form_panel()
+        self.refresh()
+
+    def rotate_page(self, idx: int, delta: int = 90) -> None:
+        doc = self.window_.view.doc
+        if doc is None or idx < 0 or idx >= len(doc):
+            return
+        self.window_._snapshot()
+        page = doc[idx]
+        on_page = [ov for ov in self.window_.view.overlays if ov.page_idx == idx]
+        baked = 0
+        for ov in on_page:
+            try:
+                ov.to_pdf(page)
+                baked += 1
+            except Exception:
+                pass
+        if baked:
+            self.window_.view.overlays = [
+                ov for ov in self.window_.view.overlays if ov.page_idx != idx
+            ]
+            for ov in on_page:
+                if ov.scene() is self.window_.view.scene_:
+                    self.window_.view.scene_.removeItem(ov)
+        page.set_rotation((page.rotation + delta) % 360)
+        self._invalidate_cache_for_page(idx)
+        self.window_.view.render_all(preserve_scroll=True)
+        self.window_._mark_dirty()
+        self.window_._refresh_form_panel()
+        self.refresh_page(idx)
+
+    def delete_page(self, idx: int) -> None:
+        doc = self.window_.view.doc
+        if doc is None or idx < 0 or idx >= len(doc):
+            return
+        if len(doc) <= 1:
+            QMessageBox.information(self, "Cannot delete", "A PDF must have at least one page.")
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Delete page",
+            f"Delete page {idx + 1}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        self.window_._snapshot()
+        kept = []
+        for ov in self.window_.view.overlays:
+            if ov.page_idx == idx:
+                if ov.scene() is self.window_.view.scene_:
+                    self.window_.view.scene_.removeItem(ov)
+                continue
+            if ov.page_idx > idx:
+                ov.page_idx -= 1
+            kept.append(ov)
+        self.window_.view.overlays = kept
+        doc.delete_page(idx)
+        new_idx = min(idx, len(doc) - 1)
+        self._cache.clear()
+        self.window_.view.render_all()
+        self.window_.view.scroll_to_page(new_idx)
+        self.window_._refresh_page_label()
+        self.window_._mark_dirty()
+        self.window_._refresh_form_panel()
+        self.refresh()
+
+    def insert_blank_page(self, idx: int, *, after: bool = True) -> None:
+        doc = self.window_.view.doc
+        if doc is None:
+            return
+        target = idx + 1 if after else idx
+        target = max(0, min(target, len(doc)))
+        self.window_._snapshot()
+        for ov in self.window_.view.overlays:
+            if ov.page_idx >= target:
+                ov.page_idx += 1
+        doc.new_page(pno=target, width=612, height=792)
+        self._cache.clear()
+        self.window_.view.render_all()
+        self.window_.view.scroll_to_page(target)
+        self.window_._refresh_page_label()
+        self.window_._mark_dirty()
+        self.window_._refresh_form_panel()
+        self.refresh()
+
+    def extract_page(self, idx: int) -> None:
+        doc = self.window_.view.doc
+        if doc is None or idx < 0 or idx >= len(doc):
+            return
+        out, _ = QFileDialog.getSaveFileName(
+            self, "Save Extracted Page", "", "PDF Files (*.pdf)"
+        )
+        if not out:
+            return
+        if not out.lower().endswith(".pdf"):
+            out += ".pdf"
+        try:
+            new_doc = fitz.open()
+            new_doc.insert_pdf(doc, from_page=idx, to_page=idx)
+            new_doc.save(out, garbage=4, deflate=True)
+            new_doc.close()
+            self.window_.statusBar().showMessage(f"Extracted page {idx + 1} to {out}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Extract Page failed", str(exc))
+
+    # --- internal helpers ---
+    def refresh_page(self, idx: int) -> None:
+        """Re-render only the thumbnail at `idx` (used after rotate/active-page changes)."""
+        if idx < 0 or idx >= self.list_widget.count():
+            self.refresh()
+            return
+        doc = self.window_.view.doc
+        if doc is None or idx >= len(doc):
+            self.refresh()
+            return
+        self._invalidate_cache_for_page(idx)
+        item = self.list_widget.item(idx)
+        if item is None:
+            return
+        pm = self._render_thumbnail(idx)
+        if pm is not None:
+            item.setIcon(self._icon_from_pixmap(pm))
+            item.setSizeHint(self._size_hint_for(pm))
+        self._update_current_highlight()
+
+    def _invalidate_cache_for_page(self, idx: int) -> None:
+        doc = self.window_.view.doc
+        if doc is None or idx >= len(doc):
+            self._cache.clear()
+            return
+        try:
+            xref = doc[idx].xref
+        except Exception:
+            self._cache.clear()
+            return
+        for k in list(self._cache.keys()):
+            if k[0] == xref:
+                del self._cache[k]
+
+    def _render_thumbnail(self, idx: int) -> "QPixmap | None":
+        doc = self.window_.view.doc
+        if doc is None or idx < 0 or idx >= len(doc):
+            return None
+        try:
+            page = doc[idx]
+            xref = page.xref
+            rotation = page.rotation
+            w = max(1.0, page.rect.width)
+            zoom = THUMBNAIL_TARGET_WIDTH / w
+        except Exception:
+            return None
+        key = (xref, rotation, round(zoom, 4))
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            img = QImage(
+                pix.samples,
+                pix.width,
+                pix.height,
+                pix.stride,
+                QImage.Format.Format_RGB888,
+            ).copy()
+            pm = QPixmap.fromImage(img)
+        except Exception:
+            return None
+        self._cache[key] = pm
+        return pm
+
+    def _icon_from_pixmap(self, pm: QPixmap):
+        from PyQt6.QtGui import QIcon
+        return QIcon(pm)
+
+    def _size_hint_for(self, pm: QPixmap):
+        from PyQt6.QtCore import QSize
+        # icon + label below: width ~thumbnail width + padding, height + ~22 for label.
+        w = pm.width() + 16
+        h = pm.height() + 26
+        return QSize(w, h)
+
+    def _update_current_highlight(self) -> None:
+        cur = self.window_.view.page_idx if self.window_.view.doc else -1
+        accent = current_accent_color()
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            if i == cur:
+                item.setBackground(QBrush(QColor(accent.red(), accent.green(), accent.blue(), 60)))
+                f = item.font()
+                f.setBold(True)
+                item.setFont(f)
+            else:
+                item.setBackground(QBrush(Qt.GlobalColor.transparent))
+                f = item.font()
+                f.setBold(False)
+                item.setFont(f)
+        if 0 <= cur < self.list_widget.count():
+            self.list_widget.blockSignals(True)
+            self.list_widget.setCurrentRow(cur)
+            self.list_widget.blockSignals(False)
+
+    # --- event handlers ---
+    def _on_item_clicked(self, item: QListWidgetItem) -> None:
+        if item is None:
+            return
+        v = item.data(self.PAGE_ROLE)
+        if v is None:
+            return
+        target = int(v)
+        if not self.window_.view.doc:
+            return
+        if 0 <= target < len(self.window_.view.doc):
+            self.window_.view.scroll_to_page(target)
+            self.window_._refresh_page_label()
+            self._update_current_highlight()
+
+    def _on_current_item_changed(self, current, _previous) -> None:
+        if current is None:
+            return
+        if self._suspend_refresh:
+            return
+        v = current.data(self.PAGE_ROLE)
+        if v is None:
+            return
+        target = int(v)
+        if not self.window_.view.doc:
+            return
+        if 0 <= target < len(self.window_.view.doc):
+            self.window_.view.scroll_to_page(target)
+            self.window_._refresh_page_label()
+
+    def _on_drop_finished(self) -> None:
+        if self._suspend_drop:
+            return
+        order: list[int] = []
+        for i in range(self.list_widget.count()):
+            v = self.list_widget.item(i).data(self.PAGE_ROLE)
+            order.append(int(v) if v is not None else 0)
+        self.commit_reorder(order)
+
+    def _on_context_menu(self, pos) -> None:
+        item = self.list_widget.itemAt(pos)
+        if item is None:
+            return
+        v = item.data(self.PAGE_ROLE)
+        if v is None:
+            return
+        idx = int(v)
+        menu = QMenu(self)
+        act_rot_r = menu.addAction("Rotate Right 90\u00b0")
+        act_rot_l = menu.addAction("Rotate Left 90\u00b0")
+        menu.addSeparator()
+        act_ins_above = menu.addAction("Insert Blank Page Above")
+        act_ins_below = menu.addAction("Insert Blank Page Below")
+        menu.addSeparator()
+        act_delete = menu.addAction("Delete Page")
+        menu.addSeparator()
+        act_extract = menu.addAction("Extract Page\u2026")
+        chosen = menu.exec(self.list_widget.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen is act_rot_r:
+            self.rotate_page(idx, 90)
+        elif chosen is act_rot_l:
+            self.rotate_page(idx, -90)
+        elif chosen is act_ins_above:
+            self.insert_blank_page(idx, after=False)
+        elif chosen is act_ins_below:
+            self.insert_blank_page(idx, after=True)
+        elif chosen is act_delete:
+            self.delete_page(idx)
+        elif chosen is act_extract:
+            self.extract_page(idx)
+
+
+def _qsize_for_thumb():
+    from PyQt6.QtCore import QSize
+    return QSize(THUMBNAIL_TARGET_WIDTH, int(THUMBNAIL_TARGET_WIDTH * 1.4))
+
+
 class FormBuilderPanel(QDockWidget):
     """Adobe-Acrobat-style "Prepare Form" side panel.
 
@@ -4771,6 +5254,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.view)
         self.setStatusBar(QStatusBar())
         self._build_toolbar()
+        self._build_thumbnails_panel()
         self._build_form_panel()
         self.statusBar().showMessage("Open a PDF to begin (⌘O) — or drop one onto the window")
 
@@ -4833,6 +5317,7 @@ class MainWindow(QMainWindow):
         self._refresh_page_label()
         self.refresh_format_toolbar()
         self._refresh_form_panel()
+        self._refresh_thumbnails_panel()
 
     def undo(self):
         if not self._undo or not self.view.doc:
@@ -5407,6 +5892,8 @@ class MainWindow(QMainWindow):
             self.page_spin.blockSignals(False)
             self.act_prev.setEnabled(False)
             self.act_next.setEnabled(False)
+        if hasattr(self, "thumbs_panel") and self.thumbs_panel is not None:
+            self.thumbs_panel._update_current_highlight()
 
     def _on_page_spin_changed(self):
         if not self.view.doc:
@@ -5545,6 +6032,7 @@ class MainWindow(QMainWindow):
         self._refresh_title()
         self._refresh_page_label()
         self._refresh_form_panel()
+        self._refresh_thumbnails_panel()
         self.statusBar().showMessage(
             f"Created new {count}-page PDF ({width_pt/72:.2f} × {height_pt/72:.2f} in)"
         )
@@ -5586,6 +6074,7 @@ class MainWindow(QMainWindow):
         self._refresh_page_label()
         self._add_recent(path)
         self._refresh_form_panel()
+        self._refresh_thumbnails_panel()
         self.statusBar().showMessage(f"Opened {path}")
 
     # --- Recent files ---
@@ -6344,6 +6833,7 @@ class MainWindow(QMainWindow):
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
         self._refresh_form_panel()
+        self._refresh_thumbnails_panel()
         if not _read_auto_open_field_properties():
             return
         try:
@@ -6597,6 +7087,7 @@ class MainWindow(QMainWindow):
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
         self._refresh_form_panel()
+        self._refresh_thumbnails_panel()
 
     def collect_all_widgets(self):
         """Document-wide tab-order source: list of (page_idx, widget) tuples
@@ -6631,6 +7122,7 @@ class MainWindow(QMainWindow):
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
         self._refresh_form_panel()
+        self._refresh_thumbnails_panel()
 
     def delete_widget(self, page_idx: int, widget):
         """Remove `widget` from page `page_idx` (with snapshot + render).
@@ -6667,6 +7159,7 @@ class MainWindow(QMainWindow):
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
         self._refresh_form_panel()
+        self._refresh_thumbnails_panel()
 
     def reset_form(self) -> None:
         """Clear every form field's value to its default state.
@@ -6728,6 +7221,7 @@ class MainWindow(QMainWindow):
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
         self._refresh_form_panel()
+        self._refresh_thumbnails_panel()
 
     def flatten_form(self) -> None:
         """Bake all form widgets into static page content (no longer editable).
@@ -6762,6 +7256,7 @@ class MainWindow(QMainWindow):
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
         self._refresh_form_panel()
+        self._refresh_thumbnails_panel()
 
     # --- Form Builder side panel (Phase 4) ---
     def _build_form_panel(self):
@@ -6832,6 +7327,75 @@ class MainWindow(QMainWindow):
                 panel.setVisible(True)
                 panel.blockSignals(False)
 
+    # --- Page Thumbnails side panel ---
+    def _build_thumbnails_panel(self) -> None:
+        self.thumbs_panel = PageThumbnailsPanel(self)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.thumbs_panel)
+        self.act_show_thumbs_panel = self.thumbs_panel.toggleViewAction()
+        self.act_show_thumbs_panel.setText("Show Page Thumbnails")
+
+        for mb in (self.menuBar(), self.in_app_menubar):
+            menus = []
+            if isinstance(mb, QToolBar):
+                for act in mb.actions():
+                    btn = mb.widgetForAction(act)
+                    if isinstance(btn, QToolButton) and btn.menu() is not None and btn.text() == "View":
+                        menus.append(btn.menu())
+            else:
+                for act in mb.actions():
+                    if act.menu() is not None and (act.text() == "&View" or act.text() == "View"):
+                        menus.append(act.menu())
+            for menu in menus:
+                menu.addSeparator()
+                menu.addAction(self.act_show_thumbs_panel)
+
+        self._thumbs_panel_user_choice: bool | None = self._read_thumbs_panel_visibility()
+        if self._thumbs_panel_user_choice is None:
+            self.thumbs_panel.setVisible(True)
+        else:
+            self.thumbs_panel.setVisible(self._thumbs_panel_user_choice)
+        self.thumbs_panel.visibilityChanged.connect(self._on_thumbs_panel_visibility_changed)
+
+    def _read_thumbs_panel_visibility(self) -> "bool | None":
+        try:
+            s = QSettings()
+            v = s.value(PAGE_THUMBNAILS_PANEL_VISIBLE_KEY)
+        except Exception:
+            return None
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            return v.lower() in ("true", "1", "yes")
+        try:
+            return bool(int(v))
+        except Exception:
+            return bool(v)
+
+    def _on_thumbs_panel_visibility_changed(self, visible: bool) -> None:
+        self._thumbs_panel_user_choice = visible
+        try:
+            QSettings().setValue(PAGE_THUMBNAILS_PANEL_VISIBLE_KEY, visible)
+        except Exception:
+            pass
+
+    def _refresh_thumbnails_panel(self) -> None:
+        panel = getattr(self, "thumbs_panel", None)
+        if panel is None:
+            return
+        if not panel.isVisible():
+            panel._needs_refresh = True
+            return
+        panel.refresh()
+
+    def _refresh_thumbnails_active(self) -> None:
+        """Cheap update — just re-highlight the current page without re-rendering."""
+        panel = getattr(self, "thumbs_panel", None)
+        if panel is None:
+            return
+        panel._update_current_highlight()
+
     def focus_widget_in_view(self, page_idx: int, widget) -> None:
         """Scroll the view to a widget and draw a transient highlight ring."""
         if not self.view.doc or widget is None:
@@ -6878,7 +7442,10 @@ class MainWindow(QMainWindow):
     def _hide_widget_highlight(self) -> None:
         item = getattr(self, "_widget_highlight_item", None)
         if item is not None:
-            item.setVisible(False)
+            try:
+                item.setVisible(False)
+            except RuntimeError:
+                self._widget_highlight_item = None
 
     # --- Page management ---
     def rotate_current_page(self):
@@ -6912,6 +7479,7 @@ class MainWindow(QMainWindow):
         self.view.show_search_overlays([])
         self._mark_dirty()
         self._refresh_form_panel()
+        self._refresh_thumbnails_panel()
         msg = f"Rotated page {idx + 1}"
         if baked:
             msg += f" (flattened {baked} item{'s' if baked != 1 else ''})"
@@ -6938,6 +7506,7 @@ class MainWindow(QMainWindow):
         self._refresh_page_label()
         self._mark_dirty()
         self._refresh_form_panel()
+        self._refresh_thumbnails_panel()
         self.statusBar().showMessage(f"Inserted blank page after page {idx + 1}")
 
     def delete_current_page(self):
@@ -6978,6 +7547,7 @@ class MainWindow(QMainWindow):
         self._refresh_page_label()
         self._mark_dirty()
         self._refresh_form_panel()
+        self._refresh_thumbnails_panel()
         self.statusBar().showMessage(f"Deleted page {idx + 1}")
 
     # --- Find ---
