@@ -80,6 +80,7 @@ from PyQt6.QtWidgets import (
     QStackedWidget,
     QStatusBar,
     QTabWidget,
+    QTextEdit,
     QToolBar,
     QToolButton,
     QTreeWidget,
@@ -951,8 +952,10 @@ class SettingsDialog(QDialog):
         self.font_spin = QSpinBox()
         self.font_spin.setRange(10, 18)
         self.font_spin.setValue(int(UI_FONT_PT))
-        self.font_slider.valueChanged.connect(self._on_font_slider_changed)
-        self.font_spin.valueChanged.connect(self._on_font_spin_changed)
+        self.font_slider.valueChanged.connect(self._on_font_slider_value_mirror)
+        self.font_slider.sliderReleased.connect(self._on_font_slider_released)
+        self.font_spin.valueChanged.connect(self._on_font_spin_value_mirror)
+        self.font_spin.editingFinished.connect(self._on_font_spin_edit_finished)
         fr.addWidget(self.font_slider, 1)
         fr.addWidget(self.font_spin)
         af.addRow("UI font size:", font_row)
@@ -1047,19 +1050,28 @@ class SettingsDialog(QDialog):
 
     # ----- Font size ---------------------------------------------------------
 
-    def _on_font_slider_changed(self, value: int) -> None:
+    def _on_font_slider_value_mirror(self, value: int) -> None:
         if self.font_spin.value() != value:
             self.font_spin.blockSignals(True)
             self.font_spin.setValue(value)
             self.font_spin.blockSignals(False)
-        self._apply_font_size(value)
+        # Apply only when this came from outside mouse-drag (arrow keys, keyboard
+        # paging, programmatic setValue). Mid-drag value ticks fall through to
+        # sliderReleased instead, avoiding a QSS rebuild on every pixel.
+        if not self.font_slider.isSliderDown():
+            self._apply_font_size(value)
 
-    def _on_font_spin_changed(self, value: int) -> None:
+    def _on_font_slider_released(self) -> None:
+        self._apply_font_size(self.font_slider.value())
+
+    def _on_font_spin_value_mirror(self, value: int) -> None:
         if self.font_slider.value() != value:
             self.font_slider.blockSignals(True)
             self.font_slider.setValue(value)
             self.font_slider.blockSignals(False)
-        self._apply_font_size(value)
+
+    def _on_font_spin_edit_finished(self) -> None:
+        self._apply_font_size(self.font_spin.value())
 
     def _apply_font_size(self, value: int) -> None:
         global UI_FONT_PT
@@ -1073,7 +1085,7 @@ class SettingsDialog(QDialog):
     # ----- Accent color ------------------------------------------------------
 
     def _refresh_accent_swatch(self) -> None:
-        accent = LIGHT_PALETTE.get("accent", "#2563EB")
+        accent = current_accent_color().name()
         self.accent_btn.setText(accent.upper())
         # Inline style overrides theme QSS for this single button.
         text_color = "#FFFFFF" if QColor(accent).lightness() < 160 else "#0F172A"
@@ -1083,7 +1095,7 @@ class SettingsDialog(QDialog):
         )
 
     def _on_accent_button_clicked(self) -> None:
-        start = QColor(LIGHT_PALETTE.get("accent", "#2563EB"))
+        start = current_accent_color()
         c = QColorDialog.getColor(start, self, "Choose accent color")
         if c.isValid():
             self._on_accent_chosen(c)
@@ -1114,6 +1126,7 @@ class SettingsDialog(QDialog):
             s = QSettings()
             s.remove("accentColor")
             s.remove("uiFontPt")
+            s.remove(THEME_SETTINGS_KEY)
         except Exception:
             pass
         self.font_slider.blockSignals(True)
@@ -1122,6 +1135,12 @@ class SettingsDialog(QDialog):
         self.font_spin.setValue(int(UI_FONT_PT))
         self.font_slider.blockSignals(False)
         self.font_spin.blockSignals(False)
+        for i in range(self.theme_combo.count()):
+            if self.theme_combo.itemData(i) == "system":
+                self.theme_combo.blockSignals(True)
+                self.theme_combo.setCurrentIndex(i)
+                self.theme_combo.blockSignals(False)
+                break
         apply_theme(self._app, current_theme_name())
         self._refresh_accent_swatch()
 
@@ -1157,8 +1176,9 @@ class SettingsDialog(QDialog):
             self,
             "Reset all settings",
             "Clear every saved preference and restore defaults?\n\n"
-            "Theme, font size, and accent color will revert immediately. "
-            "Other changes take effect on next launch.",
+            "Theme, font size, and accent color apply immediately. "
+            "Editor pattern and auto-open Properties apply immediately. "
+            "Form Builder panel default visibility takes effect on next launch.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -1191,6 +1211,18 @@ class SettingsDialog(QDialog):
                 self.theme_combo.blockSignals(False)
                 break
         set_theme(self._app, "system")
+        # Propagate form-panel default to the running MainWindow so its
+        # cached user-choice doesn't keep the panel pinned visible/hidden
+        # against the freshly cleared default.
+        parent = self.parent()
+        if isinstance(parent, MainWindow) and hasattr(parent, "form_panel"):
+            parent._form_panel_user_choice = None
+            try:
+                parent.form_panel.blockSignals(True)
+                parent.form_panel.setVisible(_read_form_panel_default_visible())
+                parent.form_panel.blockSignals(False)
+            except Exception:
+                pass
 
 
 class PageNumbersDialog(QDialog):
@@ -4867,6 +4899,10 @@ class MainWindow(QMainWindow):
         self.act_prev = make("Previous Page", lambda: self.change_page(-1), "Ctrl+Left")
         self.act_next = make("Next Page", lambda: self.change_page(1), "Ctrl+Right")
         self.act_zoom_in = make("Zoom In", lambda: self.zoom_by(1.15), "Ctrl+=")
+        self.act_zoom_in.setShortcuts([
+            QKeySequence("Ctrl+="),
+            QKeySequence("Ctrl+Shift+="),
+        ])
         self.act_zoom_out = make("Zoom Out", lambda: self.zoom_by(1 / 1.15), "Ctrl+-")
         self.act_zoom_reset = make("Actual Size", lambda: self.set_zoom(1.0), "Ctrl+0")
 
@@ -4957,58 +4993,12 @@ class MainWindow(QMainWindow):
                 act.setChecked(True)
         self._tool_keys = tool_keys
 
-        # ---- Menu structure (label, list of actions; None = separator;
-        # QMenu = submenu) ----
-        _form_action_set = set(self._form_actions)
-        _insert_actions = [a for a in self._tool_actions if a not in _form_action_set]
-        menu_spec: list[tuple[str, list]] = [
-            ("&File", [self.act_new, self.act_open, self.recent_menu, None,
-                       self.act_save, self.act_save_as, None,
-                       self.act_merge, self.act_extract, None,
-                       self.act_preferences]),
-            ("&Edit", [self.act_undo, self.act_redo, None,
-                       self.act_find, self.act_find_next, self.act_find_prev]),
-            ("&View", [self.act_prev, self.act_next, None,
-                       self.act_zoom_in, self.act_zoom_out, self.act_zoom_reset]),
-            ("&Insert", [*_insert_actions, None, self.act_page_numbers]),
-            ("&Pages", [self.act_insert_blank, self.act_rotate, self.act_delete_page]),
-            ("&Forms", [*self._form_actions, None, self.act_tab_order,
-                        None, self.act_reset_form, self.act_flatten_form]),
-            ("&Tools", [self.act_watermark]),
-        ]
-
-        def _add_to_menu(menu, items):
-            for it in items:
-                if it is None:
-                    menu.addSeparator()
-                elif isinstance(it, QMenu):
-                    menu.addMenu(it)
-                else:
-                    menu.addAction(it)
-
-        # Native top-of-screen bar (default on macOS)
-        native_mb = self.menuBar()
-        native_mb.setNativeMenuBar(True)
-        for label, items in menu_spec:
-            menu = native_mb.addMenu(label)
-            _add_to_menu(menu, items)
-
-        # In-window duplicate: a QToolBar of QToolButtons with popup menus.
-        # We use this rather than a second QMenuBar because Qt on macOS won't
-        # render a non-native QMenuBar widget reliably alongside the native one.
+        # ---- Slim toolbar: page nav, tool modes, find ----
+        # Menu construction is deferred to the end of _build_ui so the Format
+        # submenu can reference the format actions defined further down.
         self.in_app_menubar = QToolBar("Menus")
         self.in_app_menubar.setObjectName("InAppMenuBar")
         self.in_app_menubar.setMovable(False)
-        for label, items in menu_spec:
-            btn = QToolButton(self.in_app_menubar)
-            btn.setText(label.replace("&", ""))
-            btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-            menu = QMenu(btn)
-            _add_to_menu(menu, items)
-            btn.setMenu(menu)
-            self.in_app_menubar.addWidget(btn)
-
-        # ---- Slim toolbar: page nav, tool modes, find ----
         tb = QToolBar("Main")
         tb.setObjectName("MainToolBar")
         tb.setMovable(False)
@@ -5135,6 +5125,81 @@ class MainWindow(QMainWindow):
         self.act_text_color.triggered.connect(self._fmt_change_color)
         fmt.addAction(self.act_text_color)
 
+        # ---- Menu structure (label, list of actions; None = separator;
+        # QMenu = submenu) -----------------------------------------------
+        _form_action_set = set(self._form_actions)
+        _insert_actions = [
+            a for a in self._tool_actions
+            if a not in _form_action_set and a.data() != "select"
+        ]
+        format_menu = QMenu("&Format", self)
+        for fa in (self.act_bold, self.act_italic, self.act_underline,
+                   self.act_strike):
+            format_menu.addAction(fa)
+        format_menu.addSeparator()
+        format_menu.addAction(self.act_text_color)
+        format_menu.addSeparator()
+        format_menu.addAction(self.act_size_up)
+        format_menu.addAction(self.act_size_down)
+        self.format_menu = format_menu
+        menu_spec: list[tuple[str, list]] = [
+            ("&File", [self.act_new, self.act_open, self.recent_menu, None,
+                       self.act_save, self.act_save_as, None,
+                       self.act_merge, self.act_extract, None,
+                       self.act_preferences]),
+            ("&Edit", [self.act_undo, self.act_redo, None,
+                       self.act_find, self.act_find_next, self.act_find_prev,
+                       None, format_menu]),
+            ("&View", [self.act_prev, self.act_next, None,
+                       self.act_zoom_in, self.act_zoom_out, self.act_zoom_reset]),
+            ("&Insert", [*_insert_actions, None, self.act_page_numbers]),
+            ("&Pages", [self.act_insert_blank, self.act_rotate, self.act_delete_page]),
+            ("&Forms", [*self._form_actions, None, self.act_tab_order,
+                        None, self.act_reset_form, self.act_flatten_form]),
+            ("&Tools", [self.act_watermark]),
+        ]
+        self._menu_spec = menu_spec
+
+        def _add_to_menu(menu, items):
+            for it in items:
+                if it is None:
+                    menu.addSeparator()
+                elif isinstance(it, QMenu):
+                    menu.addMenu(it)
+                else:
+                    menu.addAction(it)
+
+        # Native top-of-screen bar (default on macOS)
+        native_mb = self.menuBar()
+        native_mb.setNativeMenuBar(True)
+        for label, items in menu_spec:
+            menu = native_mb.addMenu(label)
+            _add_to_menu(menu, items)
+
+        # In-window duplicate: a QToolBar of QToolButtons with popup menus.
+        # We use this rather than a second QMenuBar because Qt on macOS won't
+        # render a non-native QMenuBar widget reliably alongside the native one.
+        for label, items in menu_spec:
+            btn = QToolButton(self.in_app_menubar)
+            btn.setText(label.replace("&", ""))
+            btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+            menu = QMenu(btn)
+            # When a QMenu is reused across menubars (native + in-app), Qt only
+            # renders it under one parent. Build a fresh QMenu here for the
+            # in-app menubar so submenus like Format show up in both bars.
+            for it in items:
+                if it is None:
+                    menu.addSeparator()
+                elif isinstance(it, QMenu):
+                    sub = QMenu(it.title(), menu)
+                    for sub_act in it.actions():
+                        sub.addAction(sub_act)
+                    menu.addMenu(sub)
+                else:
+                    menu.addAction(it)
+            btn.setMenu(menu)
+            self.in_app_menubar.addWidget(btn)
+
         self.refresh_format_toolbar()
         self._install_tool_shortcuts()
 
@@ -5163,7 +5228,7 @@ class MainWindow(QMainWindow):
         # Also skip if focus is in any text-input widget (find box, font-size
         # spinbox, format-toolbar editable combo, etc.). focusWidget() returns
         # the wrapper, not the inner QLineEdit, so check for the wrappers too.
-        if isinstance(focus, (QLineEdit, QAbstractSpinBox)):
+        if isinstance(focus, (QLineEdit, QAbstractSpinBox, QPlainTextEdit, QTextEdit)):
             return
         if isinstance(focus, QComboBox) and focus.isEditable():
             return
@@ -5211,6 +5276,15 @@ class MainWindow(QMainWindow):
         self.act_strike.setChecked(it.strike)
 
     def _fmt_toggle(self, attr: str, checked: bool):
+        # Don't steal Ctrl+B/I/U from a text-input widget that has focus
+        # (e.g. the find box, a properties dialog QLineEdit). The format
+        # actions are WindowShortcut by default — without this guard the
+        # keystroke fires here AND never reaches the focused editor.
+        focus = QApplication.focusWidget()
+        if isinstance(focus, (QLineEdit, QAbstractSpinBox, QPlainTextEdit, QTextEdit)):
+            return
+        if isinstance(focus, QComboBox) and focus.isEditable():
+            return
         boxes = self._selected_textboxes()
         if not boxes:
             return
@@ -6779,18 +6853,18 @@ class MainWindow(QMainWindow):
         item = getattr(self, "_widget_highlight_item", None)
         if item is None or item.scene() is not self.view.scene_:
             item = QGraphicsRectItem()
-            accent = current_accent_color()
-            pen_color = QColor(accent)
-            pen_color.setAlpha(220)
-            brush_color = QColor(accent)
-            brush_color.setAlpha(40)
-            pen = QPen(pen_color)
-            pen.setWidth(3)
-            item.setPen(pen)
-            item.setBrush(QBrush(brush_color))
             item.setZValue(10000)
             self.view.scene_.addItem(item)
             self._widget_highlight_item = item
+        accent = current_accent_color()
+        pen_color = QColor(accent)
+        pen_color.setAlpha(220)
+        brush_color = QColor(accent)
+        brush_color.setAlpha(40)
+        pen = QPen(pen_color)
+        pen.setWidth(3)
+        item.setPen(pen)
+        item.setBrush(QBrush(brush_color))
         item.setRect(scene_rect)
         item.setVisible(True)
         timer = getattr(self, "_widget_highlight_timer", None)
@@ -6984,6 +7058,21 @@ class _PDFApp(QApplication):
         super().__init__(argv)
         self._win: MainWindow | None = None
         self._pending: list[str] = []
+        try:
+            hints = self.styleHints()
+            if hints is not None and hasattr(hints, "colorSchemeChanged"):
+                hints.colorSchemeChanged.connect(self._on_os_color_scheme_changed)
+        except Exception:
+            pass
+
+    def _on_os_color_scheme_changed(self, *_args) -> None:
+        # Only re-apply when the user has chosen "system" — explicit light/dark
+        # picks should not flip out from under them on an OS toggle.
+        try:
+            if current_theme_name() == "system":
+                apply_theme(self, current_theme_name())
+        except Exception:
+            pass
 
     def set_window(self, win: "MainWindow"):
         self._win = win
