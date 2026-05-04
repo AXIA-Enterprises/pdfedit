@@ -285,19 +285,30 @@ def installed_system_fonts() -> list[str]:
     return _installed_system_fonts_cache
 
 
-def parse_page_range(spec: str, max_pages: int) -> list[int]:
+def parse_page_range(
+    spec: str, max_pages: int
+) -> tuple[list[int], list[str]]:
     """Parse a 1-based page range spec like "1,3-5,8" → sorted 0-based indices.
 
-    - Handles single pages, dashes (inclusive ranges), commas, whitespace.
-    - Reversed dash order is normalized ("5-3" == "3-5").
-    - Out-of-range entries are clamped/dropped.
-    - Empty string → empty list.
+    Returns ``(pages, warnings)``:
+    - ``pages``: sorted, deduped 0-based indices clamped to ``[0, max_pages-1]``.
+    - ``warnings``: human-readable strings about edge cases the caller may
+      want to surface in a ``QMessageBox.warning`` (out-of-range entries,
+      ``0`` as a 1-based page, etc.). Always present, often empty.
+
+    Friendly edge cases:
+    - "1-"  → 1..max_pages
+    - "-3"  → 1..3
+    - "0"   → warning ("page 0 is not valid")
+    - integers > max_pages → warning, dropped
+    - reversed ranges ("5-3" == "3-5") are normalized.
     - Malformed (non-numeric) segments raise ValueError.
-    - De-duplicates overlapping ranges.
+    - Empty string → ([], []).
     """
     s = (spec or "").strip()
+    warnings: list[str] = []
     if not s:
-        return []
+        return [], warnings
     seen: set[int] = set()
     for raw in s.split(","):
         seg = raw.strip()
@@ -307,13 +318,22 @@ def parse_page_range(spec: str, max_pages: int) -> list[int]:
             a_str, b_str = seg.split("-", 1)
             a_str = a_str.strip()
             b_str = b_str.strip()
+            # Open-ended ranges: "1-" → 1..max, "-3" → 1..3.
+            if not a_str and not b_str:
+                raise ValueError(f"Invalid page range segment: {seg!r}")
             try:
-                a = int(a_str)
-                b = int(b_str)
+                a = int(a_str) if a_str else 1
+                b = int(b_str) if b_str else max_pages
             except ValueError as exc:
                 raise ValueError(f"Invalid page range segment: {seg!r}") from exc
             if a > b:
                 a, b = b, a
+            if b > max_pages:
+                warnings.append(
+                    f"range {seg!r} exceeds document length ({max_pages} pages)"
+                )
+            if a < 1:
+                warnings.append(f"range {seg!r} starts below page 1")
             for p in range(a, b + 1):
                 if 1 <= p <= max_pages:
                     seen.add(p - 1)
@@ -322,9 +342,19 @@ def parse_page_range(spec: str, max_pages: int) -> list[int]:
                 p = int(seg)
             except ValueError as exc:
                 raise ValueError(f"Invalid page number: {seg!r}") from exc
-            if 1 <= p <= max_pages:
-                seen.add(p - 1)
-    return sorted(seen)
+            if p == 0:
+                warnings.append("page 0 is not valid (pages are 1-based)")
+                continue
+            if p < 0:
+                warnings.append(f"negative page {p} ignored")
+                continue
+            if p > max_pages:
+                warnings.append(
+                    f"page {p} exceeds document length ({max_pages} pages)"
+                )
+                continue
+            seen.add(p - 1)
+    return sorted(seen), warnings
 
 
 # ---------------------------------------------------------------------------
@@ -1163,6 +1193,81 @@ class SettingsDialog(QDialog):
         set_theme(self._app, "system")
 
 
+class PageNumbersDialog(QDialog):
+    """Configure inserting page numbers — position, format, font size, start, skip-first."""
+
+    POSITIONS = [
+        ("Bottom Center", "bottom-center"),
+        ("Bottom Left", "bottom-left"),
+        ("Bottom Right", "bottom-right"),
+        ("Top Center", "top-center"),
+        ("Top Left", "top-left"),
+        ("Top Right", "top-right"),
+    ]
+
+    # {n} = current page number, {N} = total. Total uses the *original* page
+    # count (before skip-first shifts), so "Page 1 of 5" reads naturally.
+    FORMATS = [
+        ("1", "{n}"),
+        ("1 / N", "{n} / {N}"),
+        ("Page 1", "Page {n}"),
+        ("Page 1 of N", "Page {n} of {N}"),
+        ("- 1 -", "- {n} -"),
+    ]
+
+    def __init__(self, parent=None, page_count: int = 1):
+        super().__init__(parent)
+        self.setWindowTitle("Page Numbers")
+        self.setMinimumWidth(380)
+
+        self.position_box = QComboBox()
+        for label, _ in self.POSITIONS:
+            self.position_box.addItem(label)
+
+        self.format_box = QComboBox()
+        for label, _ in self.FORMATS:
+            self.format_box.addItem(label)
+        self.format_box.setCurrentIndex(3)  # "Page 1 of N"
+
+        self.size_box = QSpinBox()
+        self.size_box.setRange(6, 24)
+        self.size_box.setValue(12)
+
+        self.start_box = QSpinBox()
+        self.start_box.setRange(1, 9999)
+        self.start_box.setValue(1)
+
+        self.skip_first_chk = QCheckBox("Skip first page")
+
+        form = QFormLayout()
+        form.addRow("Position:", self.position_box)
+        form.addRow("Format:", self.format_box)
+        form.addRow("Font size:", self.size_box)
+        form.addRow("Starting number:", self.start_box)
+        form.addRow("", self.skip_first_chk)
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(bb)
+
+    def values(self) -> dict:
+        _, position = self.POSITIONS[self.position_box.currentIndex()]
+        _, fmt_template = self.FORMATS[self.format_box.currentIndex()]
+        return {
+            "position": position,
+            "format": fmt_template,
+            "size": int(self.size_box.value()),
+            "start": int(self.start_box.value()),
+            "skip_first": self.skip_first_chk.isChecked(),
+        }
+
+
 class WatermarkDialog(QDialog):
     """Configure a text watermark — text, font, size, opacity, rotation, color, range."""
 
@@ -1212,6 +1317,21 @@ class WatermarkDialog(QDialog):
             lambda on: self.range_edit.setEnabled(not on)
         )
 
+        # Live preview — styling-only (no page bg). Emits a counter on every
+        # update so tests can verify control changes wire through.
+        self.preview = QLabel("DRAFT")
+        self.preview.setMinimumHeight(110)
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview.setStyleSheet(
+            "border:1px solid palette(mid); background:palette(base);"
+        )
+        self.preview_update_count = 0
+        self.text_edit.textChanged.connect(self._update_preview)
+        self.font_box.currentTextChanged.connect(self._update_preview)
+        self.size_box.valueChanged.connect(self._update_preview)
+        self.opacity_box.valueChanged.connect(self._update_preview)
+        self.rotation_box.valueChanged.connect(self._update_preview)
+
         form = QFormLayout()
         form.addRow("Text:", self.text_edit)
         form.addRow("Font:", self.font_box)
@@ -1219,6 +1339,7 @@ class WatermarkDialog(QDialog):
         form.addRow("Opacity:", self.opacity_box)
         form.addRow("Rotation°:", self.rotation_box)
         form.addRow("Color:", self.color_btn)
+        form.addRow("Preview:", self.preview)
         form.addRow("", self.all_pages_chk)
         form.addRow("Pages:", self.range_edit)
 
@@ -1232,11 +1353,32 @@ class WatermarkDialog(QDialog):
         layout.addLayout(form)
         layout.addWidget(bb)
 
+        self._update_preview()
+
+    def _update_preview(self):
+        text = self.text_edit.text() or "DRAFT"
+        family = self.font_box.currentText().strip() or "Helvetica"
+        # Cap the preview font size so big watermark sizes don't blow out the
+        # dialog. The preview is a relative styling indicator, not 1:1 scale.
+        pt = max(8, min(int(self.size_box.value() * 0.5), 48))
+        font = QFont(family, pt)
+        self.preview.setFont(font)
+        self.preview.setText(text)
+        c = self.color
+        opacity = float(self.opacity_box.value())
+        # QLabel doesn't support graphics rotation; show rotation via text only.
+        self.preview.setStyleSheet(
+            "border:1px solid palette(mid); background:palette(base);"
+            f"color: rgba({c.red()}, {c.green()}, {c.blue()}, {opacity});"
+        )
+        self.preview_update_count += 1
+
     def _pick_color(self):
         c = QColorDialog.getColor(self.color, self, "Watermark Color")
         if c.isValid():
             self.color = c
             self._update_color_btn()
+            self._update_preview()
 
     def _update_color_btn(self):
         self.color_btn.setText(self.color.name())
@@ -3051,8 +3193,19 @@ class PDFView(QGraphicsView):
         mods = ev.modifiers()
         if mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier):
             factor = 1.15 if ev.angleDelta().y() > 0 else 1 / 1.15
-            self.zoom = max(0.3, min(self.zoom * factor, 6.0))
-            self.render_all(preserve_scroll=True)
+            new_zoom = max(0.3, min(self.zoom * factor, 6.0))
+            if new_zoom == self.zoom:
+                return
+            cursor_view = ev.position().toPoint()
+            old_scene = self.mapToScene(cursor_view)
+            self.zoom = new_zoom
+            self.render_all(preserve_scroll=False)
+            new_screen = self.mapFromScene(old_scene)
+            delta = new_screen - cursor_view
+            hbar = self.horizontalScrollBar()
+            vbar = self.verticalScrollBar()
+            hbar.setValue(hbar.value() + delta.x())
+            vbar.setValue(vbar.value() + delta.y())
         else:
             super().wheelEvent(ev)
 
@@ -4580,6 +4733,7 @@ class MainWindow(QMainWindow):
         self._search_results: list[tuple[int, fitz.Rect]] = []
         self._search_idx = -1
         self._search_query = ""
+        self._search_case = False
 
         self.view = PDFView(self)
         self.setCentralWidget(self.view)
@@ -4707,6 +4861,7 @@ class MainWindow(QMainWindow):
         self.act_find.setShortcut("Ctrl+F")
         self.act_find.setShortcutVisibleInContextMenu(True)
         self.act_find_next = make("Find Next", self.find_next, "Ctrl+G")
+        self.act_find_prev = make("Find Previous", self.find_prev, "Ctrl+Shift+G")
 
         # View
         self.act_prev = make("Previous Page", lambda: self.change_page(-1), "Ctrl+Left")
@@ -4812,7 +4967,7 @@ class MainWindow(QMainWindow):
                        self.act_merge, self.act_extract, None,
                        self.act_preferences]),
             ("&Edit", [self.act_undo, self.act_redo, None,
-                       self.act_find, self.act_find_next]),
+                       self.act_find, self.act_find_next, self.act_find_prev]),
             ("&View", [self.act_prev, self.act_next, None,
                        self.act_zoom_in, self.act_zoom_out, self.act_zoom_reset]),
             ("&Insert", [*_insert_actions, None, self.act_page_numbers]),
@@ -4862,15 +5017,20 @@ class MainWindow(QMainWindow):
         self.addToolBarBreak()
         self.addToolBar(tb)
 
-        # Page nav
-        prev_btn = QAction("◀", self)
-        prev_btn.triggered.connect(lambda: self.change_page(-1))
-        tb.addAction(prev_btn)
-        self.page_label = QLabel("  —  ")
+        # Page nav — editable spinner like Adobe lets users jump by typing.
+        tb.addAction(self.act_prev)
+        self.page_spin = QSpinBox()
+        self.page_spin.setRange(1, 1)
+        self.page_spin.setValue(1)
+        self.page_spin.setFixedWidth(70)
+        self.page_spin.setKeyboardTracking(False)
+        # editingFinished fires on Enter/blur; valueChanged would fire on every
+        # up/down click during typing, scattering scroll mid-edit.
+        self.page_spin.editingFinished.connect(self._on_page_spin_changed)
+        tb.addWidget(self.page_spin)
+        self.page_label = QLabel(" / —")
         tb.addWidget(self.page_label)
-        next_btn = QAction("▶", self)
-        next_btn.triggered.connect(lambda: self.change_page(1))
-        tb.addAction(next_btn)
+        tb.addAction(self.act_next)
         tb.addSeparator()
 
         # Tool modes
@@ -4888,6 +5048,11 @@ class MainWindow(QMainWindow):
         self.find_box.setFixedWidth(180)
         self.find_box.returnPressed.connect(self.find_next)
         tb.addWidget(self.find_box)
+        self.find_case_chk = QCheckBox("Match case")
+        # PyMuPDF's search_for is case-insensitive; we filter results when
+        # this is on. Toggling resets the cached query so the next find re-runs.
+        self.find_case_chk.toggled.connect(self._on_find_case_toggled)
+        tb.addWidget(self.find_case_chk)
         self.find_status = QLabel("")
         tb.addWidget(self.find_status)
 
@@ -5149,11 +5314,33 @@ class MainWindow(QMainWindow):
 
     def _refresh_page_label(self):
         if self.view.doc:
-            self.page_label.setText(
-                f"  Page {self.view.page_idx + 1} / {self.view.page_count()}  "
-            )
+            count = self.view.page_count()
+            idx = self.view.page_idx
+            self.page_label.setText(f" / {count}")
+            self.page_spin.blockSignals(True)
+            self.page_spin.setRange(1, max(1, count))
+            self.page_spin.setValue(idx + 1)
+            self.page_spin.setEnabled(True)
+            self.page_spin.blockSignals(False)
+            self.act_prev.setEnabled(idx > 0)
+            self.act_next.setEnabled(idx < count - 1)
         else:
-            self.page_label.setText("  —  ")
+            self.page_label.setText(" / —")
+            self.page_spin.blockSignals(True)
+            self.page_spin.setRange(1, 1)
+            self.page_spin.setValue(1)
+            self.page_spin.setEnabled(False)
+            self.page_spin.blockSignals(False)
+            self.act_prev.setEnabled(False)
+            self.act_next.setEnabled(False)
+
+    def _on_page_spin_changed(self):
+        if not self.view.doc:
+            return
+        target = self.page_spin.value() - 1
+        delta = target - self.view.page_idx
+        if delta != 0:
+            self.change_page(delta)
 
     # --- Drag and drop ---
     def dragEnterEvent(self, ev):
@@ -5676,25 +5863,50 @@ class MainWindow(QMainWindow):
         self._mark_dirty()
         self.refresh_format_toolbar()
 
-    def add_page_numbers(self):
+    def add_page_numbers(self, *, options: dict | None = None):
         if not self.view.doc:
             return
-        self._snapshot()
         total = len(self.view.doc)
+        if options is None:
+            dlg = PageNumbersDialog(self, page_count=total)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            options = dlg.values()
+        position = options.get("position", "bottom-center")
+        fmt = options.get("format", "Page {n} of {N}")
+        size = int(options.get("size", 12))
+        start = int(options.get("start", 1))
+        skip_first = bool(options.get("skip_first", False))
+
+        self._snapshot()
         applied = 0
         failures: list[str] = []
+        margin = max(18.0, size * 1.5)
         for i in range(total):
+            if skip_first and i == 0:
+                continue
             page = self.view.doc[i]
-            text = f"Page {i + 1} of {total}"
+            n = start + (i - 1 if skip_first else i)
+            text = fmt.format(n=n, N=total)
             try:
-                tw = fitz.get_text_length(text, fontname="tiro", fontsize=12)
+                tw = fitz.get_text_length(text, fontname="helv", fontsize=size)
             except Exception:
-                tw = len(text) * 6.0
-            x = (page.rect.width - tw) / 2
-            y = page.rect.height - 24
+                tw = len(text) * size * 0.55
+            page_w = page.rect.width
+            page_h = page.rect.height
+            if position.endswith("-center"):
+                x = (page_w - tw) / 2
+            elif position.endswith("-left"):
+                x = margin
+            else:  # right
+                x = page_w - tw - margin
+            if position.startswith("top-"):
+                y = margin
+            else:
+                y = page_h - margin / 1.5
             try:
                 page.insert_text(
-                    (x, y), text, fontname="tiro", fontsize=12, color=(0, 0, 0)
+                    (x, y), text, fontname="helv", fontsize=size, color=(0, 0, 0)
                 )
                 applied += 1
             except Exception as exc:
@@ -5758,10 +5970,15 @@ class MainWindow(QMainWindow):
             indices = list(range(page_count))
         else:
             try:
-                indices = parse_page_range(v.get("range", ""), page_count)
+                indices, warnings = parse_page_range(v.get("range", ""), page_count)
             except ValueError as exc:
                 QMessageBox.warning(self, "Watermark", f"Bad page range: {exc}")
                 return
+            if warnings:
+                QMessageBox.warning(
+                    self, "Watermark",
+                    "Page range had issues:\n\n" + "\n".join(f"  • {w}" for w in warnings),
+                )
             if not indices:
                 QMessageBox.warning(self, "Watermark", "No pages selected.")
                 return
@@ -5874,10 +6091,15 @@ class MainWindow(QMainWindow):
         if not ok or not spec.strip():
             return
         try:
-            indices = parse_page_range(spec, page_count)
+            indices, warnings = parse_page_range(spec, page_count)
         except ValueError as exc:
             QMessageBox.warning(self, "Extract Pages", f"Bad page range: {exc}")
             return
+        if warnings:
+            QMessageBox.warning(
+                self, "Extract Pages",
+                "Page range had issues:\n\n" + "\n".join(f"  • {w}" for w in warnings),
+            )
         if not indices:
             QMessageBox.warning(self, "Extract Pages", "No pages selected.")
             return
@@ -6610,6 +6832,10 @@ class MainWindow(QMainWindow):
                     self.view.scene_.removeItem(ov)
         page.set_rotation((page.rotation + 90) % 360)
         self.view.render_all(preserve_scroll=True)
+        self._search_results = []
+        self._search_idx = -1
+        self.find_status.setText("")
+        self.view.show_search_overlays([])
         self._mark_dirty()
         self._refresh_form_panel()
         msg = f"Rotated page {idx + 1}"
@@ -6622,14 +6848,19 @@ class MainWindow(QMainWindow):
             return
         self._snapshot()
         idx = self.view.page_idx
-        ref = self.view.doc[idx]
         # Bump page_idx for overlays that sit on pages after the new one.
         for ov in self.view.overlays:
             if ov.page_idx > idx:
                 ov.page_idx += 1
-        self.view.doc.new_page(pno=idx + 1, width=ref.rect.width, height=ref.rect.height)
+        # US Letter (612×792 pt) is the standard default; matching the current
+        # page's dimensions surprised users with mixed sheet sizes in audit 10.
+        self.view.doc.new_page(pno=idx + 1, width=612, height=792)
         self.view.render_all()
         self.view.scroll_to_page(idx + 1)
+        self._search_results = []
+        self._search_idx = -1
+        self.find_status.setText("")
+        self.view.show_search_overlays([])
         self._refresh_page_label()
         self._mark_dirty()
         self._refresh_form_panel()
@@ -6666,25 +6897,56 @@ class MainWindow(QMainWindow):
         new_idx = min(idx, len(self.view.doc) - 1)
         self.view.render_all()
         self.view.scroll_to_page(new_idx)
+        self._search_results = []
+        self._search_idx = -1
+        self.find_status.setText("")
+        self.view.show_search_overlays([])
         self._refresh_page_label()
         self._mark_dirty()
         self._refresh_form_panel()
         self.statusBar().showMessage(f"Deleted page {idx + 1}")
 
     # --- Find ---
-    def find_next(self):
+    def _on_find_case_toggled(self, _checked: bool):
+        # Reset cache so the next find rebuilds with/without case-filtering.
+        self._search_query = ""
+        self._search_results = []
+        self._search_idx = -1
+        self.find_status.setText("")
+        self.view.show_search_overlays([])
+
+    def _ensure_search(self) -> bool:
+        """Build the (cached) result list for the current query. Returns True if usable."""
         if not self.view.doc:
-            return
+            return False
         query = self.find_box.text().strip()
         if not query:
-            return
-        if query != self._search_query:
+            return False
+        case_sensitive = self.find_case_chk.isChecked()
+        cache_key = (query, case_sensitive)
+        if cache_key != (self._search_query, getattr(self, "_search_case", False)):
             self._search_query = query
+            self._search_case = case_sensitive
             self._search_results = []
             for i in range(len(self.view.doc)):
-                for r in self.view.doc[i].search_for(query):
+                page = self.view.doc[i]
+                for r in page.search_for(query):
+                    if case_sensitive:
+                        # PyMuPDF's search is case-insensitive; verify exact case
+                        # by reading the matched rect's text.
+                        try:
+                            actual = page.get_textbox(r) or ""
+                        except Exception:
+                            actual = ""
+                        if query not in actual:
+                            continue
                     self._search_results.append((i, r))
             self._search_idx = -1
+        return True
+
+    def find_next(self):
+        if not self._ensure_search():
+            return
         if not self._search_results:
             self.find_status.setText("0 matches")
             self.view.show_search_overlays([])
@@ -6693,6 +6955,23 @@ class MainWindow(QMainWindow):
         self.find_status.setText(
             f"{self._search_idx + 1} / {len(self._search_results)}"
         )
+        page_idx, rect = self._search_results[self._search_idx]
+        self.view.scroll_to_pdf_rect(page_idx, rect)
+        self.view.show_search_overlays(self._search_results, self._search_idx)
+
+    def find_prev(self):
+        if not self._ensure_search():
+            return
+        if not self._search_results:
+            self.find_status.setText("0 matches")
+            self.view.show_search_overlays([])
+            return
+        n = len(self._search_results)
+        if self._search_idx <= 0:
+            self._search_idx = n - 1
+        else:
+            self._search_idx -= 1
+        self.find_status.setText(f"{self._search_idx + 1} / {n}")
         page_idx, rect = self._search_results[self._search_idx]
         self.view.scroll_to_pdf_rect(page_idx, rect)
         self.view.show_search_overlays(self._search_results, self._search_idx)

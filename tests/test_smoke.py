@@ -318,22 +318,22 @@ def test_watermark_applied_to_pages(main_window, qtbot, tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 def test_parse_page_range():
     """parse_page_range handles single pages, dashes, commas, dedup, clamping."""
-    # Basic cases.
-    assert pdfedit.parse_page_range("1", 10) == [0]
-    assert pdfedit.parse_page_range("1,3", 10) == [0, 2]
-    assert pdfedit.parse_page_range("1-3", 10) == [0, 1, 2]
-    assert pdfedit.parse_page_range("1,3-5,8", 10) == [0, 2, 3, 4, 7]
+    # Basic cases — return shape is (pages, warnings).
+    assert pdfedit.parse_page_range("1", 10)[0] == [0]
+    assert pdfedit.parse_page_range("1,3", 10)[0] == [0, 2]
+    assert pdfedit.parse_page_range("1-3", 10)[0] == [0, 1, 2]
+    assert pdfedit.parse_page_range("1,3-5,8", 10)[0] == [0, 2, 3, 4, 7]
     # De-dup overlapping ranges.
-    assert pdfedit.parse_page_range("1-3,2-4", 10) == [0, 1, 2, 3]
+    assert pdfedit.parse_page_range("1-3,2-4", 10)[0] == [0, 1, 2, 3]
     # Reversed dash order is normalized.
-    assert pdfedit.parse_page_range("5-3", 10) == [2, 3, 4]
+    assert pdfedit.parse_page_range("5-3", 10)[0] == [2, 3, 4]
     # Out-of-range entries are dropped (not raised).
-    assert pdfedit.parse_page_range("8-15", 10) == [7, 8, 9]
-    assert pdfedit.parse_page_range("0,11", 10) == []
+    assert pdfedit.parse_page_range("8-15", 10)[0] == [7, 8, 9]
+    assert pdfedit.parse_page_range("0,11", 10)[0] == []
     # Whitespace tolerance.
-    assert pdfedit.parse_page_range(" 1 , 3 - 4 ", 10) == [0, 2, 3]
+    assert pdfedit.parse_page_range(" 1 , 3 - 4 ", 10)[0] == [0, 2, 3]
     # Empty input → empty result, not an error.
-    assert pdfedit.parse_page_range("", 10) == []
+    assert pdfedit.parse_page_range("", 10) == ([], [])
     # Malformed input raises ValueError.
     import pytest as _pytest
     with _pytest.raises(ValueError):
