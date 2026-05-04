@@ -33,6 +33,12 @@ from PyQt6.QtWidgets import QDialog as _QDialog  # noqa: E402
 _original_field_props_exec = pdfedit.FieldPropertiesDialog.exec
 pdfedit.FieldPropertiesDialog.exec = lambda self: _QDialog.DialogCode.Rejected
 
+# do_add_text now opens AddTextDialog before creating a TextBoxItem. Under the
+# offscreen platform .exec() blocks forever; auto-accept so existing tests
+# continue to drive the textbox flow without prompting.
+_original_add_text_exec = pdfedit.AddTextDialog.exec
+pdfedit.AddTextDialog.exec = lambda self: _QDialog.DialogCode.Accepted
+
 
 @pytest.fixture(scope="session", autouse=True)
 def _disable_unsaved_changes_dialog():

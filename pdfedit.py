@@ -56,6 +56,7 @@ from PyQt6.QtWidgets import (
     QFormLayout,
     QGraphicsItem,
     QGraphicsPathItem,
+    QGraphicsPixmapItem,
     QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsTextItem,
@@ -95,6 +96,14 @@ APP_NAME = "PDFEdit"
 APP_DIR = Path.home() / ".pdfedit"
 FONT_CACHE = APP_DIR / "fonts"
 FONT_CACHE.mkdir(parents=True, exist_ok=True)
+
+# Saved-annotation stroke colors. Match the rubber-band preview so what the
+# user sees while dragging is what the saved annotation looks like.
+ANNOTATION_COLORS = {
+    "highlight": (1.0, 0.95, 0.0),
+    "underline": (0.235, 0.51, 0.86),
+    "strikeout": (0.235, 0.51, 0.86),
+}
 
 # Built-in PDF base14 fonts — no download needed, ship with every PDF reader.
 BUILTIN_FONTS = ["Times", "Helvetica", "Courier"]
@@ -1270,15 +1279,25 @@ class AddTextDialog(QDialog):
         self.size_box.setRange(4, 288)
         self.size_box.setValue(12)
         self.color = QColor(0, 0, 0)
-        self.color_btn = QPushButton("Black")
+        self.color_btn = QPushButton()
         self.color_btn.clicked.connect(self._pick_color)
         self._update_color_btn()
+
+        self.preview = QLabel("Sample text")
+        self.preview.setMinimumHeight(40)
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._update_preview()
+
+        self.text_edit.textChanged.connect(self._update_preview)
+        self.font_box.currentTextChanged.connect(self._update_preview)
+        self.size_box.valueChanged.connect(self._update_preview)
 
         form = QFormLayout()
         form.addRow("Text:", self.text_edit)
         form.addRow("Font:", self.font_box)
         form.addRow("Size:", self.size_box)
         form.addRow("Color:", self.color_btn)
+        form.addRow("Preview:", self.preview)
 
         bb = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -1298,6 +1317,7 @@ class AddTextDialog(QDialog):
         if c.isValid():
             self.color = c
             self._update_color_btn()
+            self._update_preview()
 
     def _update_color_btn(self):
         self.color_btn.setText(self.color.name())
@@ -1305,6 +1325,14 @@ class AddTextDialog(QDialog):
             f"background:{self.color.name()};"
             f"color:{'white' if self.color.lightness() < 128 else 'black'};"
         )
+
+    def _update_preview(self):
+        sample = self.text_edit.text() or "Sample text"
+        self.preview.setText(sample)
+        f = QFont(self.font_box.currentText().strip() or "Helvetica")
+        f.setPointSize(int(self.size_box.value()))
+        self.preview.setFont(f)
+        self.preview.setStyleSheet(f"color:{self.color.name()};")
 
     def values(self):
         return (
@@ -2420,6 +2448,160 @@ class SignatureItem(QGraphicsPathItem):
         )
 
 
+class _ImageResizeHandle(QGraphicsRectItem):
+    """Bottom-right corner handle for resizing an ImageOverlayItem in 2D."""
+
+    SIZE = 10
+
+    def __init__(self, parent: "ImageOverlayItem"):
+        super().__init__(0, 0, self.SIZE, self.SIZE, parent)
+        self.img = parent
+        self.setBrush(QBrush(QColor(60, 130, 220)))
+        self.setPen(QPen(QColor(255, 255, 255), 1))
+        self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        self.setAcceptHoverEvents(True)
+        self._dragging = False
+        self._press_scene = QPointF(0.0, 0.0)
+        self._initial_pdf_w = 0.0
+        self._initial_pdf_h = 0.0
+        self.hide()
+
+    def mousePressEvent(self, ev):
+        self._dragging = True
+        self._press_scene = ev.scenePos()
+        self._initial_pdf_w = self.img.pdf_w
+        self._initial_pdf_h = self.img.pdf_h
+        try:
+            self.img.view.window_._snapshot()
+        except Exception:
+            pass
+        ev.accept()
+
+    def mouseMoveEvent(self, ev):
+        if not self._dragging:
+            return
+        z = self.img.view.zoom
+        delta = ev.scenePos() - self._press_scene
+        new_w = max(10.0, self._initial_pdf_w + delta.x() / z)
+        new_h = max(10.0, self._initial_pdf_h + delta.y() / z)
+        self.img.pdf_w = new_w
+        self.img.pdf_h = new_h
+        self.img.refresh()
+        ev.accept()
+
+    def mouseReleaseEvent(self, ev):
+        self._dragging = False
+        try:
+            self.img.view.window_._mark_dirty()
+        except Exception:
+            pass
+        ev.accept()
+
+
+class ImageOverlayItem(QGraphicsPixmapItem):
+    """A movable, resizable image overlay tied to a specific PDF page.
+
+    Stays as a Qt scene item until baked into the PDF on save.
+    """
+
+    DISPLAY_NAME = "Image"
+
+    def __init__(self, view, page_idx: int, path: str,
+                 pdf_x: float, pdf_y: float, pdf_w: float, pdf_h: float):
+        super().__init__()
+        self.view = view
+        self.page_idx = page_idx
+        self.path = path
+        self.pdf_x = pdf_x
+        self.pdf_y = pdf_y
+        self.pdf_w = pdf_w
+        self.pdf_h = pdf_h
+        self._source_pixmap = QPixmap(path)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsFocusable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsScenePositionChanges, True)
+        self.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+        self._handle = _ImageResizeHandle(self)
+        self.refresh()
+
+    def refresh(self):
+        if not self.view._page_geom or self.page_idx >= len(self.view._page_geom):
+            return
+        top = self.view._page_geom[self.page_idx][0]
+        z = self.view.zoom
+        self.setPos(PAGE_MARGIN + self.pdf_x * z, top + self.pdf_y * z)
+        w_px = max(1, int(self.pdf_w * z))
+        h_px = max(1, int(self.pdf_h * z))
+        if not self._source_pixmap.isNull():
+            self.setPixmap(self._source_pixmap.scaled(
+                w_px, h_px,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            ))
+        self.position_handle()
+
+    def position_handle(self):
+        z = self.view.zoom
+        self._handle.setPos(
+            self.pdf_w * z - _ImageResizeHandle.SIZE,
+            self.pdf_h * z - _ImageResizeHandle.SIZE,
+        )
+
+    def paint(self, painter, option, widget=None):
+        super().paint(painter, option, widget)
+        if self.isSelected():
+            painter.save()
+            pen = QPen(QColor(60, 130, 220), 1, Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            z = self.view.zoom
+            painter.drawRect(QRectF(0, 0, self.pdf_w * z, self.pdf_h * z))
+            painter.restore()
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
+            geom = self.view._page_geom
+            if self.page_idx < len(geom):
+                top = geom[self.page_idx][0]
+                z = self.view.zoom
+                p = self.pos()
+                self.pdf_x = (p.x() - PAGE_MARGIN) / z
+                self.pdf_y = (p.y() - top) / z
+                w = self.view.window_
+                if not w.dirty:
+                    w._mark_dirty()
+        elif change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
+            self._handle.setVisible(bool(value))
+            self.view.window_.refresh_format_toolbar()
+        return super().itemChange(change, value)
+
+    def to_pdf(self, page):
+        rect = fitz.Rect(
+            self.pdf_x, self.pdf_y,
+            self.pdf_x + self.pdf_w, self.pdf_y + self.pdf_h,
+        )
+        page.insert_image(rect, filename=self.path, keep_proportion=True)
+
+    def serialize(self) -> dict:
+        return {
+            "kind": "image",
+            "page_idx": self.page_idx,
+            "path": self.path,
+            "pdf_x": self.pdf_x,
+            "pdf_y": self.pdf_y,
+            "pdf_w": self.pdf_w,
+            "pdf_h": self.pdf_h,
+        }
+
+    @classmethod
+    def deserialize(cls, view, d: dict) -> "ImageOverlayItem":
+        return cls(
+            view, d["page_idx"], d["path"],
+            d["pdf_x"], d["pdf_y"], d["pdf_w"], d["pdf_h"],
+        )
+
+
 class PDFView(QGraphicsView):
     """Renders all PDF pages stacked vertically and dispatches mouse interactions."""
 
@@ -2722,14 +2904,14 @@ class PDFView(QGraphicsView):
 
         if self.mode in ("erase", "form-text", "form-check", "highlight",
                           "underline", "strikeout",
-                          "add-text", "signature"):
+                          "add-text", "signature", "image"):
             if self.mode == "highlight":
                 line_color = QColor(245, 220, 20, 220)
                 fill = QColor(245, 220, 20, 90)
             elif self.mode in ("underline", "strikeout"):
                 line_color = QColor(60, 130, 220, 220)
                 fill = QColor(60, 130, 220, 30)
-            elif self.mode in ("add-text", "signature"):
+            elif self.mode in ("add-text", "signature", "image"):
                 line_color = QColor(60, 130, 220, 220)
                 fill = QColor(60, 130, 220, 50)
             else:
@@ -2782,7 +2964,7 @@ class PDFView(QGraphicsView):
         elif mode == "signature":
             self.window_.do_signature(page, rx0, ry0, rx1, ry1)
         elif mode == "image":
-            self.window_.do_insert_image(page, sx, sy)
+            self.window_.do_insert_image(page, rx0, ry0, rx1, ry1)
         elif mode == "erase":
             self.window_.do_erase(page, rx0, ry0, rx1, ry1)
         elif mode == "highlight":
@@ -4287,6 +4469,8 @@ class MainWindow(QMainWindow):
                 ov = TextBoxItem.deserialize(self.view, d)
             elif kind == "signature":
                 ov = SignatureItem.deserialize(self.view, d)
+            elif kind == "image":
+                ov = ImageOverlayItem.deserialize(self.view, d)
             else:
                 continue
             self.view.overlays.append(ov)
@@ -5110,12 +5294,24 @@ class MainWindow(QMainWindow):
 
     # --- edit ops ---
     def do_add_text(self, page_idx: int, x0: float, y0: float, x1: float, y1: float):
-        """Drop a floating, editable textbox at the dragged rect. Single-click → 240pt wide."""
+        """Drop a floating, editable textbox at the dragged rect. Single-click → 240pt wide.
+
+        Opens AddTextDialog first so the user can pick text/font/size/color
+        before the overlay materializes. Cancelling drops nothing.
+        """
+        dlg = AddTextDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        text, family, size_pt, color = dlg.values()
         w = x1 - x0
         if w < 30:
             w = 240
         self._snapshot()
-        item = TextBoxItem(self.view, page_idx, x0, y0, w)
+        item = TextBoxItem(
+            self.view, page_idx, x0, y0, w,
+            text=text, family=family or "Helvetica",
+            size_pt=size_pt, color=color,
+        )
         self.view.overlays.append(item)
         self.view.scene_.addItem(item)
         # Switch back to Select so the user can move/edit further
@@ -5429,7 +5625,7 @@ class MainWindow(QMainWindow):
         self._snapshot()
         page = self.view.doc[page_idx]
         annot = page.add_highlight_annot(fitz.Rect(x0, y0, x1, y1))
-        annot.set_colors(stroke=(1, 0.95, 0))
+        annot.set_colors(stroke=ANNOTATION_COLORS["highlight"])
         annot.update()
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
@@ -5440,6 +5636,7 @@ class MainWindow(QMainWindow):
         self._snapshot()
         page = self.view.doc[page_idx]
         annot = page.add_underline_annot(fitz.Rect(x0, y0, x1, y1))
+        annot.set_colors(stroke=ANNOTATION_COLORS["underline"])
         annot.update()
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
@@ -5450,15 +5647,21 @@ class MainWindow(QMainWindow):
         self._snapshot()
         page = self.view.doc[page_idx]
         annot = page.add_strikeout_annot(fitz.Rect(x0, y0, x1, y1))
+        annot.set_colors(stroke=ANNOTATION_COLORS["strikeout"])
         annot.update()
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
 
     def do_sticky(self, page_idx: int, x: float, y: float):
+        # Empty body → user cancelled by typing nothing; surface a status
+        # message and skip creation rather than creating an empty note.
         body, ok = QInputDialog.getMultiLineText(
             self, "Sticky Note", "Note text:"
         )
-        if not ok or not body:
+        if not ok:
+            return
+        if not body:
+            self.statusBar().showMessage("Sticky note cancelled — empty body")
             return
         self._snapshot()
         page = self.view.doc[page_idx]
@@ -5466,7 +5669,14 @@ class MainWindow(QMainWindow):
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
 
-    def do_insert_image(self, page_idx: int, x: float, y: float):
+    def do_insert_image(self, page_idx: int, x0: float, y0: float,
+                         x1: float, y1: float):
+        """Drop an image as a draggable, resizable overlay.
+
+        Bakes only at save time via ImageOverlayItem.to_pdf. If the drag rect
+        is too small (click-only or tiny drag), falls back to a 200pt-wide
+        default sized to the image's aspect ratio.
+        """
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Insert Image",
@@ -5480,22 +5690,38 @@ class MainWindow(QMainWindow):
             if img.isNull():
                 raise ValueError("Could not read image")
             iw, ih = img.width(), img.height()
-            target_w = 200.0
-            target_h = target_w * (ih / iw) if iw else target_w
         except Exception as exc:
             QMessageBox.warning(self, "Insert image failed", str(exc))
             return
 
+        drag_w = x1 - x0
+        drag_h = y1 - y0
+        if drag_w < 30 or drag_h < 30:
+            target_w = 200.0
+            target_h = target_w * (ih / iw) if iw else target_w
+            px, py = x0, y0
+        else:
+            target_w = drag_w
+            target_h = drag_h
+            px, py = x0, y0
+
         self._snapshot()
-        page = self.view.doc[page_idx]
-        rect = fitz.Rect(x, y, x + target_w, y + target_h)
         try:
-            page.insert_image(rect, filename=path, keep_proportion=True)
+            item = ImageOverlayItem(
+                self.view, page_idx, path, px, py, target_w, target_h,
+            )
         except Exception as exc:
             QMessageBox.warning(self, "Insert image failed", str(exc))
-            self._undo.pop()  # rollback snapshot
+            try:
+                if self._undo:
+                    self._undo.pop()
+            except Exception:
+                pass
             return
-        self.view.render_all(preserve_scroll=True)
+        self.view.overlays.append(item)
+        self.view.scene_.addItem(item)
+        self._activate_tool("select")
+        item.setSelected(True)
         self._mark_dirty()
         self.statusBar().showMessage(f"Inserted {os.path.basename(path)}")
 
