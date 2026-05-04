@@ -12,7 +12,19 @@ from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
 import fitz  # PyMuPDF
-from PyQt6.QtCore import QEvent, QPointF, QRectF, QSettings, Qt, QTimer
+from PyQt6.QtCore import (
+    QEvent,
+    QObject,
+    QPointF,
+    QRectF,
+    QRunnable,
+    QSettings,
+    Qt,
+    QThread,
+    QThreadPool,
+    QTimer,
+    pyqtSignal,
+)
 from PyQt6.QtGui import (
     QAction,
     QActionGroup,
@@ -1454,6 +1466,98 @@ CURSIVE_FONTS = ["Dancing Script", "Pacifico", "Caveat", "Permanent Marker",
                  "Lobster", "Shadows Into Light"]
 
 
+# Family names already registered with QFontDatabase. Set by both the
+# pre-fetch thread (after a successful download) and on-demand fetches
+# inside the SignatureDialog. Read from any thread; only mutated on the
+# Qt main thread (signal/slot), so no extra lock needed.
+_loaded_font_families: set[str] = set()
+
+
+def _register_font_file(family: str, ttf_path: Path) -> bool:
+    """Register a TTF with QFontDatabase if not already registered.
+    Returns True on success (or already-registered)."""
+    if family in _loaded_font_families:
+        return True
+    try:
+        from PyQt6.QtGui import QFontDatabase
+        fid = QFontDatabase.addApplicationFont(str(ttf_path))
+        if fid >= 0:
+            _loaded_font_families.add(family)
+            return True
+    except Exception as exc:
+        print(f"[fonts] register {family}: {exc}", file=sys.stderr)
+    return False
+
+
+class _FontPrefetchThread(QThread):
+    """Walk CURSIVE_FONTS once at startup and pull each TTF into the cache.
+
+    Runs off the GUI thread so the network calls in fetch_google_font()
+    can't freeze the window. Failures are logged and skipped — the
+    SignatureDialog handles the absent-cache case at use-time.
+    """
+
+    fetched = pyqtSignal(str, str)  # family, path-or-empty-string
+
+    def run(self):
+        for family in CURSIVE_FONTS:
+            try:
+                p = fetch_google_font(family)
+            except Exception as exc:
+                print(f"[fonts] prefetch {family}: {exc}", file=sys.stderr)
+                p = None
+            self.fetched.emit(family, str(p) if p else "")
+
+
+_font_prefetch_thread: _FontPrefetchThread | None = None
+
+
+def start_font_prefetch(parent: QObject | None = None) -> _FontPrefetchThread:
+    """Kick off the cursive-font pre-fetch once, on the QApplication thread.
+
+    Idempotent: subsequent calls return the existing thread. Caller must
+    hold a reference (we stash one in a module global) so the QThread
+    isn't garbage-collected mid-run.
+    """
+    global _font_prefetch_thread
+    if _font_prefetch_thread is not None:
+        return _font_prefetch_thread
+    th = _FontPrefetchThread(parent)
+
+    def _on_fetched(family: str, path: str) -> None:
+        if path:
+            _register_font_file(family, Path(path))
+
+    th.fetched.connect(_on_fetched)
+    _font_prefetch_thread = th
+    th.start()
+    return th
+
+
+class _FontFetchSignals(QObject):
+    """Signal carrier for _FontFetchTask (QRunnable can't emit directly)."""
+
+    done = pyqtSignal(str, str)  # family, path-or-empty-string
+
+
+class _FontFetchTask(QRunnable):
+    """One-shot Google-font fetch run on the QThreadPool. Used when the user
+    picks a font in the SignatureDialog that wasn't pre-fetched at startup."""
+
+    def __init__(self, family: str):
+        super().__init__()
+        self.family = family
+        self.signals = _FontFetchSignals()
+
+    def run(self):
+        try:
+            p = fetch_google_font(self.family)
+        except Exception as exc:
+            print(f"[fonts] on-demand {self.family}: {exc}", file=sys.stderr)
+            p = None
+        self.signals.done.emit(self.family, str(p) if p else "")
+
+
 class _DrawCanvas(QWidget):
     """Tiny widget for capturing freehand strokes with mouse/trackpad.
     Strokes are stored already-normalized 0..1 against the widget size at
@@ -1465,6 +1569,11 @@ class _DrawCanvas(QWidget):
         self.setStyleSheet("background: white; border: 1px solid #ccc;")
         self.strokes: list[list[tuple[float, float]]] = []
         self._drawing = False
+        self.stroke_color: QColor = QColor(0, 0, 0)
+
+    def set_stroke_color(self, c: QColor) -> None:
+        self.stroke_color = QColor(c)
+        self.update()
 
     def _norm(self, ev) -> tuple[float, float]:
         w = max(1, self.width())
@@ -1503,7 +1612,7 @@ class _DrawCanvas(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.fillRect(self.rect(), QColor(255, 255, 255))
-        pen = QPen(QColor(0, 0, 0), 2)
+        pen = QPen(QColor(self.stroke_color), 2)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         p.setPen(pen)
@@ -1529,11 +1638,17 @@ class _CursivePreview(QLabel):
 class SignatureDialog(QDialog):
     """Two ways to make a signature: type your name in a cursive font, or draw one."""
 
+    PREVIEW_POINT_SIZE = 34
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Add Signature")
         self.setMinimumWidth(480)
         self.result_data: dict | None = None
+        self._type_color: QColor = QColor(0, 0, 0)
+        self._draw_color: QColor = QColor(0, 0, 0)
+        self._pending_family: str | None = None  # family being fetched on-demand
+        self._size_pt: int = 24
 
         tabs = QTabWidget()
 
@@ -1546,15 +1661,43 @@ class SignatureDialog(QDialog):
         self.type_font.addItems(CURSIVE_FONTS)
         self.type_font.setCurrentText("Dancing Script")
         self.type_preview = _CursivePreview()
-        self.type_input.textChanged.connect(self._update_preview)
-        self.type_font.currentTextChanged.connect(self._update_preview)
+        self.type_status = QLabel("")
+        self.type_status.setStyleSheet("color: #888; font-size: 11px;")
+
+        self.type_size = QSpinBox()
+        self.type_size.setRange(10, 96)
+        self.type_size.setValue(self._size_pt)
+        self.type_size.setSuffix(" pt")
+        self.type_color_btn = QPushButton("Color…")
+        self.type_color_btn.clicked.connect(self._pick_type_color)
+        self._refresh_type_color_swatch()
+
+        # Split signal handlers: text changes only re-set the preview text
+        # (cheap), font changes go through the font-loader path.
+        self.type_input.textChanged.connect(self._refresh_text)
+        self.type_font.currentTextChanged.connect(self._refresh_font)
+        self.type_size.valueChanged.connect(self._refresh_size)
+
         ty.addWidget(QLabel("Type your name:"))
         ty.addWidget(self.type_input)
         ty.addWidget(QLabel("Style:"))
         ty.addWidget(self.type_font)
+        size_row = QHBoxLayout()
+        size_row.addWidget(QLabel("Size:"))
+        size_row.addWidget(self.type_size)
+        size_row.addSpacing(12)
+        size_row.addWidget(QLabel("Color:"))
+        size_row.addWidget(self.type_color_btn)
+        size_row.addStretch()
+        ty.addLayout(size_row)
         ty.addWidget(QLabel("Preview:"))
         ty.addWidget(self.type_preview)
-        tabs.addTab(type_widget, "Type")
+        ty.addWidget(self.type_status)
+        type_hint = QLabel("You can drag the corners to resize after placing on the page.")
+        type_hint.setStyleSheet("color: #666; font-size: 11px;")
+        type_hint.setWordWrap(True)
+        ty.addWidget(type_hint)
+        tabs.addTab(type_widget, "Type signature")
 
         # --- Draw tab ---
         draw_widget = QWidget()
@@ -1562,16 +1705,25 @@ class SignatureDialog(QDialog):
         dw.addWidget(QLabel("Sign with your mouse or trackpad:"))
         self.draw_canvas = _DrawCanvas()
         dw.addWidget(self.draw_canvas)
+        self.draw_color_btn = QPushButton("Color…")
+        self.draw_color_btn.clicked.connect(self._pick_draw_color)
+        self._refresh_draw_color_swatch()
         undo_stroke_btn = QPushButton("Undo last stroke")
         undo_stroke_btn.clicked.connect(self.draw_canvas.undo_stroke)
         clear_btn = QPushButton("Clear")
         clear_btn.clicked.connect(self.draw_canvas.clear)
         btn_row = QHBoxLayout()
+        btn_row.addWidget(QLabel("Color:"))
+        btn_row.addWidget(self.draw_color_btn)
         btn_row.addStretch()
         btn_row.addWidget(undo_stroke_btn)
         btn_row.addWidget(clear_btn)
         dw.addLayout(btn_row)
-        tabs.addTab(draw_widget, "Draw")
+        draw_hint = QLabel("You can drag the corners to resize after placing on the page.")
+        draw_hint.setStyleSheet("color: #666; font-size: 11px;")
+        draw_hint.setWordWrap(True)
+        dw.addWidget(draw_hint)
+        tabs.addTab(draw_widget, "Draw signature")
 
         bb = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -1583,20 +1735,102 @@ class SignatureDialog(QDialog):
         layout.addWidget(tabs)
         layout.addWidget(bb)
         self._tabs = tabs
-        self._update_preview()
+        # Default to the Type tab and force a preview repaint so the user
+        # sees the correct font/text the moment the dialog opens.
+        tabs.setCurrentIndex(0)
+        tabs.currentChanged.connect(self._on_tab_changed)
+        # Initial paint
+        self._refresh_text()
+        self._refresh_font(self.type_font.currentText())
 
-    def _update_preview(self):
+    def _refresh_type_color_swatch(self) -> None:
+        c = self._type_color.name()
+        self.type_color_btn.setStyleSheet(
+            f"QPushButton {{ background: {c}; color: white; padding: 4px 12px; }}"
+        )
+
+    def _refresh_draw_color_swatch(self) -> None:
+        c = self._draw_color.name()
+        self.draw_color_btn.setStyleSheet(
+            f"QPushButton {{ background: {c}; color: white; padding: 4px 12px; }}"
+        )
+
+    def _pick_type_color(self) -> None:
+        c = QColorDialog.getColor(self._type_color, self, "Signature color")
+        if c.isValid():
+            self._type_color = c
+            self._refresh_type_color_swatch()
+            self.type_preview.setStyleSheet(
+                f"background: white; border: 1px solid #ccc; padding: 8px; color: {c.name()};"
+            )
+
+    def _pick_draw_color(self) -> None:
+        c = QColorDialog.getColor(self._draw_color, self, "Signature color")
+        if c.isValid():
+            self._draw_color = c
+            self._refresh_draw_color_swatch()
+            self.draw_canvas.set_stroke_color(c)
+
+    def _on_tab_changed(self, idx: int) -> None:
+        if idx == 0:
+            # Force a repaint so the preview is current after a tab switch.
+            self._refresh_text()
+            self._refresh_font(self.type_font.currentText())
+
+    def _refresh_text(self) -> None:
         text = self.type_input.text() or "Your Name"
-        family = self.type_font.currentText()
-        # Trigger Google Font fetch so the preview matches what gets baked.
-        ttf = fetch_google_font(family)
-        if ttf:
-            from PyQt6.QtGui import QFontDatabase
-            QFontDatabase.addApplicationFont(str(ttf))
-        f = QFont(family)
-        f.setPointSize(34)
-        self.type_preview.setFont(f)
+        # Strip any " (font failed to load)" suffix from a previous render.
         self.type_preview.setText(text)
+
+    def _refresh_size(self, value: int) -> None:
+        self._size_pt = int(value)
+        f = self.type_preview.font()
+        f.setPointSize(max(10, min(96, self._size_pt + 10)))
+        self.type_preview.setFont(f)
+
+    def _refresh_font(self, family: str) -> None:
+        if not family:
+            return
+        # Already loaded → set immediately.
+        if family in _loaded_font_families:
+            self._apply_preview_font(family, status="")
+            return
+        # Try cached file on disk before going to the network.
+        cached = FONT_CACHE / f"{family.replace(' ', '_')}.ttf"
+        if cached.exists() and cached.stat().st_size > 0:
+            if _register_font_file(family, cached):
+                self._apply_preview_font(family, status="")
+                return
+        # Otherwise kick off a non-blocking fetch.
+        self._pending_family = family
+        f = QFont()
+        f.setItalic(True)
+        f.setPointSize(self.PREVIEW_POINT_SIZE)
+        self.type_preview.setFont(f)
+        self.type_status.setText(f"(loading {family}…)")
+        task = _FontFetchTask(family)
+        task.signals.done.connect(self._on_font_fetch_done)
+        QThreadPool.globalInstance().start(task)
+
+    def _apply_preview_font(self, family: str, status: str = "") -> None:
+        f = QFont(family)
+        f.setPointSize(self.PREVIEW_POINT_SIZE)
+        self.type_preview.setFont(f)
+        self.type_status.setText(status)
+
+    def _on_font_fetch_done(self, family: str, path: str) -> None:
+        # Drop late results for a font the user has already moved past.
+        if family != self.type_font.currentText():
+            return
+        if path:
+            ok = _register_font_file(family, Path(path))
+            if ok:
+                self._apply_preview_font(family, status="")
+                return
+        # Fallback: show system default with a visible failure indicator so
+        # the user knows the choice didn't take effect.
+        self.type_preview.setFont(QFont())
+        self.type_status.setText(f"(font “{family}” failed to load — using system default)")
 
     def _accept(self):
         if self._tabs.currentIndex() == 0:
@@ -1608,6 +1842,8 @@ class SignatureDialog(QDialog):
                 "kind": "typed",
                 "text": text,
                 "family": self.type_font.currentText(),
+                "color": self._type_color.name(),
+                "size_pt": int(self._size_pt),
             }
         else:
             strokes = self.draw_canvas.normalized_strokes()
@@ -1615,7 +1851,11 @@ class SignatureDialog(QDialog):
             if not strokes:
                 QMessageBox.information(self, "No drawing", "Draw your signature first.")
                 return
-            self.result_data = {"kind": "drawn", "strokes": strokes}
+            self.result_data = {
+                "kind": "drawn",
+                "strokes": strokes,
+                "color": self._draw_color.name(),
+            }
         self.accept()
 
 
@@ -1679,6 +1919,8 @@ class _ResizeHandle(QGraphicsRectItem):
 class TextBoxItem(QGraphicsTextItem):
     """A movable, editable text overlay tied to a specific PDF page.
     Stays in the scene as a Qt item until baked into the PDF on save."""
+
+    DISPLAY_NAME = "Text box"
 
     def __init__(
         self,
@@ -1948,8 +2190,107 @@ class TextBoxItem(QGraphicsTextItem):
         return item
 
 
+def _typed_signature_strokes(
+    text: str, family: str, target_w: float, target_h: float
+) -> tuple[list[list[tuple[float, float]]], float, float]:
+    """Render `text` in `family` to a QPainterPath, then sample the path into
+    polyline strokes normalized 0..1 against the rendered text's bbox.
+
+    Returns (strokes, pdf_w, pdf_h). pdf_w/pdf_h are sized so the typed text
+    fits inside (target_w, target_h) without distorting its natural aspect.
+    Empty strokes returned if the path is empty (caller falls back).
+    """
+    if not text.strip():
+        return [], 0.0, 0.0
+    f = QFont(family)
+    f.setPointSize(48)
+    path = QPainterPath()
+    path.addText(0.0, 0.0, f, text)
+    br = path.boundingRect()
+    if br.width() <= 0 or br.height() <= 0:
+        return [], 0.0, 0.0
+    polys = path.toSubpathPolygons()
+    strokes: list[list[tuple[float, float]]] = []
+    bw = br.width()
+    bh = br.height()
+    bx = br.x()
+    by = br.y()
+    for poly in polys:
+        s: list[tuple[float, float]] = []
+        for pt in poly:
+            nx = (pt.x() - bx) / bw
+            ny = (pt.y() - by) / bh
+            s.append((max(0.0, min(1.0, nx)), max(0.0, min(1.0, ny))))
+        if len(s) >= 2:
+            strokes.append(s)
+    if not strokes:
+        return [], 0.0, 0.0
+    # Fit inside target rect preserving aspect.
+    natural_aspect = bw / bh
+    rect_aspect = (target_w / target_h) if target_h > 0 else natural_aspect
+    if rect_aspect > natural_aspect:
+        sig_h = target_h
+        sig_w = sig_h * natural_aspect
+    else:
+        sig_w = target_w
+        sig_h = sig_w / natural_aspect
+    return strokes, sig_w, sig_h
+
+
+class _SignatureResizeHandle(QGraphicsRectItem):
+    """Bottom-right corner handle for resizing a SignatureItem in 2D."""
+
+    SIZE = 10
+
+    def __init__(self, parent: "SignatureItem"):
+        super().__init__(0, 0, self.SIZE, self.SIZE, parent)
+        self.sig = parent
+        self.setBrush(QBrush(QColor(60, 130, 220)))
+        self.setPen(QPen(QColor(255, 255, 255), 1))
+        self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        self.setAcceptHoverEvents(True)
+        self._dragging = False
+        self._press_scene = QPointF(0.0, 0.0)
+        self._initial_pdf_w = 0.0
+        self._initial_pdf_h = 0.0
+        self.hide()
+
+    def mousePressEvent(self, ev):
+        self._dragging = True
+        self._press_scene = ev.scenePos()
+        self._initial_pdf_w = self.sig.pdf_w
+        self._initial_pdf_h = self.sig.pdf_h
+        try:
+            self.sig.view.window_._snapshot()
+        except Exception:
+            pass
+        ev.accept()
+
+    def mouseMoveEvent(self, ev):
+        if not self._dragging:
+            return
+        z = self.sig.view.zoom
+        delta = ev.scenePos() - self._press_scene
+        new_w = max(10.0, self._initial_pdf_w + delta.x() / z)
+        new_h = max(10.0, self._initial_pdf_h + delta.y() / z)
+        self.sig.pdf_w = new_w
+        self.sig.pdf_h = new_h
+        self.sig.refresh()
+        ev.accept()
+
+    def mouseReleaseEvent(self, ev):
+        self._dragging = False
+        try:
+            self.sig.view.window_._mark_dirty()
+        except Exception:
+            pass
+        ev.accept()
+
+
 class SignatureItem(QGraphicsPathItem):
     """A drawn (mouse/trackpad) signature overlay. Strokes stored in PDF-space coords."""
+
+    DISPLAY_NAME = "Signature"
 
     def __init__(self, view, page_idx: int, pdf_x: float, pdf_y: float,
                  pdf_w: float, pdf_h: float, strokes: list, color: QColor | None = None,
@@ -1970,6 +2311,7 @@ class SignatureItem(QGraphicsPathItem):
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsFocusable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsScenePositionChanges, True)
+        self._handle = _SignatureResizeHandle(self)
         self.refresh()
 
     def refresh(self):
@@ -1994,6 +2336,35 @@ class SignatureItem(QGraphicsPathItem):
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         self.setPen(pen)
+        self.position_handle()
+
+    def position_handle(self):
+        z = self.view.zoom
+        w_px = self.pdf_w * z
+        h_px = self.pdf_h * z
+        self._handle.setPos(
+            w_px - _SignatureResizeHandle.SIZE,
+            h_px - _SignatureResizeHandle.SIZE,
+        )
+
+    def boundingRect(self):
+        z = self.view.zoom
+        w_px = self.pdf_w * z
+        h_px = self.pdf_h * z
+        # Pad by half the pen width so brush strokes near edges aren't clipped.
+        pad = max(1.0, self.width_pt * z) / 2 + 1.0
+        return QRectF(-pad, -pad, w_px + 2 * pad, h_px + 2 * pad)
+
+    def paint(self, painter, option, widget=None):
+        super().paint(painter, option, widget)
+        if self.isSelected():
+            painter.save()
+            pen = QPen(QColor(60, 130, 220), 1, Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            z = self.view.zoom
+            painter.drawRect(QRectF(0, 0, self.pdf_w * z, self.pdf_h * z))
+            painter.restore()
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
@@ -2008,6 +2379,7 @@ class SignatureItem(QGraphicsPathItem):
                 if not w.dirty:
                     w._mark_dirty()
         elif change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
+            self._handle.setVisible(bool(value))
             self.view.window_.refresh_format_toolbar()
         return super().itemChange(change, value)
 
@@ -4649,7 +5021,7 @@ class MainWindow(QMainWindow):
             try:
                 ov.to_pdf(clone[ov.page_idx])
             except Exception as exc:
-                kind = "Text box" if isinstance(ov, TextBoxItem) else "Signature"
+                kind = getattr(ov, "DISPLAY_NAME", type(ov).__name__)
                 failed.append(f"{kind} on page {ov.page_idx + 1}: {exc}")
                 print(f"[bake] overlay failed: {exc}", file=sys.stderr)
         return clone, failed
@@ -4781,15 +5153,33 @@ class MainWindow(QMainWindow):
             return
         self._snapshot()
         if result["kind"] == "typed":
-            item = TextBoxItem(
-                self.view, page_idx, x0, y0, w,
-                text=result["text"],
-                family=result["family"],
-                size_pt=max(18, h * 0.6),
-                color=QColor(0, 0, 0),
+            color = QColor(result.get("color", "#000000"))
+            strokes, sig_w, sig_h = _typed_signature_strokes(
+                result["text"], result["family"], w, h
             )
-            self.view.overlays.append(item)
-            self.view.scene_.addItem(item)
+            if not strokes:
+                # Text→path conversion produced nothing usable (e.g. a font
+                # with no glyphs for the input). Fall back to a TextBoxItem.
+                item = TextBoxItem(
+                    self.view, page_idx, x0, y0, w,
+                    text=result["text"],
+                    family=result["family"],
+                    size_pt=max(18, h * 0.6),
+                    color=color,
+                )
+                self.view.overlays.append(item)
+                self.view.scene_.addItem(item)
+            else:
+                # Center inside the requested rect using the actual bbox of
+                # the rendered text path.
+                sig_x = x0 + (w - sig_w) / 2 if sig_w < w else x0
+                sig_y = y0 + (h - sig_h) / 2 if sig_h < h else y0
+                sig = SignatureItem(
+                    self.view, page_idx, sig_x, sig_y, sig_w, sig_h, strokes,
+                    color=color,
+                )
+                self.view.overlays.append(sig)
+                self.view.scene_.addItem(sig)
         else:  # drawn
             strokes = result["strokes"]  # already normalized 0..1
             # Preserve aspect ratio of the drawn strokes so the signature
@@ -4821,7 +5211,10 @@ class MainWindow(QMainWindow):
                         [((x - sx0) / sw, (y - sy0) / sh) for (x, y) in s]
                         for s in strokes
                     ]
-            sig = SignatureItem(self.view, page_idx, sig_x, sig_y, sig_w, sig_h, strokes)
+            sig = SignatureItem(
+                self.view, page_idx, sig_x, sig_y, sig_w, sig_h, strokes,
+                color=QColor(result.get("color", "#000000")),
+            )
             self.view.overlays.append(sig)
             self.view.scene_.addItem(sig)
         self._activate_tool("select")
@@ -5801,6 +6194,7 @@ def main():
     app.setApplicationDisplayName("Basic PDF Editor")
     _load_persisted_appearance()
     apply_theme(app, current_theme_name())
+    start_font_prefetch(app)
     win = MainWindow()
     win.show()
     app.set_window(win)
