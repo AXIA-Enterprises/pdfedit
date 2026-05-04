@@ -144,7 +144,13 @@ POPULAR_FONTS = [
 ]
 
 # UA without woff2 support → Google returns TTF
-_OLD_UA = "Mozilla/4.0 (compatible; MSIE 8.0; Windows NT 5.1)"
+# A modern Chrome User-Agent — Google Fonts switched its CSS response: for
+# old UAs it now returns a kit-style URL with no .ttf extension, which our
+# regex below rejects. With a modern UA it still serves the direct .ttf URL.
+_OLD_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+)
 
 
 # sfnt/OpenType/PostScript magic numbers; anything else won't load as a font and
@@ -154,40 +160,31 @@ _FONT_MAGICS = (b"\x00\x01\x00\x00", b"OTTO", b"true", b"typ1")
 # Network-fetch hardening for Google Fonts.
 _GOOGLE_FONTS_CSS_HOST = "fonts.googleapis.com"
 _GOOGLE_FONTS_CDN_HOST = "fonts.gstatic.com"
+_GOOGLE_FONTS_REPO_HOST = "raw.githubusercontent.com"
 _MAX_FONT_BYTES = 10 * 1024 * 1024  # 10 MB — generous for any single font weight.
 
+# Stable raw URLs in the official google/fonts GitHub repo. We pin to /main
+# so users always get the upstream-blessed TTF for each cursive family in
+# CURSIVE_FONTS. The Google Fonts CSS endpoint switched to woff2 + kit-style
+# URLs that no longer match a "ends in .ttf" regex, so we bypass it.
+_GOOGLE_FONT_REPO_PATHS: dict[str, str] = {
+    "Dancing Script": "ofl/dancingscript/DancingScript[wght].ttf",
+    "Pacifico": "ofl/pacifico/Pacifico-Regular.ttf",
+    "Caveat": "ofl/caveat/Caveat[wght].ttf",
+    "Permanent Marker": "apache/permanentmarker/PermanentMarker-Regular.ttf",
+    "Lobster": "ofl/lobster/Lobster-Regular.ttf",
+    "Shadows Into Light": "ofl/shadowsintolight/ShadowsIntoLight.ttf",
+}
 
-def fetch_google_font(family: str) -> Path | None:
-    """Download a Google Font TTF (regular weight) and cache it locally.
 
-    Hardened: CSS source is locked to fonts.googleapis.com, the extracted TTF
-    URL must live on fonts.gstatic.com, and the download is capped at
-    _MAX_FONT_BYTES. Any deviation fails closed (None).
-    """
+def _download_to_cache(family: str, url: str) -> Path | None:
     cached = FONT_CACHE / f"{family.replace(' ', '_')}.ttf"
-    if cached.exists() and cached.stat().st_size > 0:
-        return cached
-    url = f"https://{_GOOGLE_FONTS_CSS_HOST}/css2?family={quote(family)}&display=swap"
     tmp = cached.with_suffix(cached.suffix + ".tmp")
     try:
-        # Defense in depth — the URL above is hard-coded, but assert the host
-        # anyway so refactors can't silently widen the allow-list.
-        if urlparse(url).hostname != _GOOGLE_FONTS_CSS_HOST:
-            print(f"[fonts] {family}: refusing CSS host", file=sys.stderr)
-            return None
         req = Request(url, headers={"User-Agent": _OLD_UA})
-        css = urlopen(req, timeout=10).read().decode("utf-8", errors="ignore")
-        m = re.search(r"src:\s*url\((https?://[^)]+\.ttf)\)", css)
-        if not m:
-            return None
-        ttf_url = m.group(1)
-        if urlparse(ttf_url).hostname != _GOOGLE_FONTS_CDN_HOST:
-            print(f"[fonts] {family}: refusing TTF host {urlparse(ttf_url).hostname!r}",
-                  file=sys.stderr)
-            return None
         # read(N+1) so we can detect "longer than the cap" without
         # downloading the whole oversize payload.
-        data = urlopen(ttf_url, timeout=20).read(_MAX_FONT_BYTES + 1)
+        data = urlopen(req, timeout=20).read(_MAX_FONT_BYTES + 1)
         if len(data) > _MAX_FONT_BYTES:
             print(f"[fonts] {family}: TTF exceeds {_MAX_FONT_BYTES} byte cap",
                   file=sys.stderr)
@@ -207,6 +204,54 @@ def fetch_google_font(family: str) -> Path | None:
             pass
         except Exception:
             pass
+        return None
+
+
+def fetch_google_font(family: str) -> Path | None:
+    """Download a Google Font TTF (regular weight) and cache it locally.
+
+    Source priority:
+      1. Local cache (FONT_CACHE/<family>.ttf).
+      2. The official google/fonts GitHub repo via raw.githubusercontent.com
+         for any family in _GOOGLE_FONT_REPO_PATHS — stable .ttf URLs.
+      3. The Google Fonts CSS endpoint (legacy fallback). Modern CSS responses
+         tend to serve woff2 / kit URLs that this fallback can't parse, so
+         it's mostly useful for any family we forgot to add to the repo map.
+
+    Hardened: hosts are locked to the allow-listed hostnames; downloads are
+    capped at _MAX_FONT_BYTES; the file must start with a real TTF magic.
+    """
+    cached = FONT_CACHE / f"{family.replace(' ', '_')}.ttf"
+    if cached.exists() and cached.stat().st_size > 0:
+        return cached
+
+    repo_path = _GOOGLE_FONT_REPO_PATHS.get(family)
+    if repo_path:
+        url = f"https://{_GOOGLE_FONTS_REPO_HOST}/google/fonts/main/{repo_path}"
+        if (urlparse(url).hostname == _GOOGLE_FONTS_REPO_HOST
+                and urlparse(url).path.startswith("/google/fonts/")):
+            result = _download_to_cache(family, url)
+            if result is not None:
+                return result
+
+    # Legacy CSS-endpoint fallback. Kept for any future family we add to
+    # CURSIVE_FONTS but forget to map. Likely returns None on modern Google
+    # responses since they don't serve direct .ttf URLs anymore.
+    css_url = f"https://{_GOOGLE_FONTS_CSS_HOST}/css2?family={quote(family)}&display=swap"
+    try:
+        if urlparse(css_url).hostname != _GOOGLE_FONTS_CSS_HOST:
+            return None
+        req = Request(css_url, headers={"User-Agent": _OLD_UA})
+        css = urlopen(req, timeout=10).read().decode("utf-8", errors="ignore")
+        m = re.search(r"src:\s*url\((https?://[^)]+\.ttf)\)", css)
+        if not m:
+            return None
+        ttf_url = m.group(1)
+        if urlparse(ttf_url).hostname != _GOOGLE_FONTS_CDN_HOST:
+            return None
+        return _download_to_cache(family, ttf_url)
+    except Exception as exc:
+        print(f"[fonts] {family}: {exc}", file=sys.stderr)
         return None
 
 

@@ -17,7 +17,8 @@ if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
 if exist PDFEdit.spec del /q PDFEdit.spec
 
-"%PY%" -m PyInstaller --windowed --noconfirm --name PDFEdit pdfedit.py || goto :err
+if not exist PDFEdit.ico "%PY%" make_icon.py
+"%PY%" -m PyInstaller --windowed --noconfirm --name PDFEdit --icon PDFEdit.ico pdfedit.py || goto :err
 
 if exist PDFEdit rmdir /s /q PDFEdit
 move /y dist\PDFEdit PDFEdit >nul

@@ -1,6 +1,6 @@
 # PDFEdit
 
-A no-friction desktop PDF editor for macOS, Linux, and Windows. Open a PDF, edit text with Google Fonts and common system fonts, add signatures and watermarks, annotate, rearrange pages, and save. Single Python file, single zip per platform, no cloud.
+**A fast, free, cross-platform PDF editor.**
 
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![Build status](https://github.com/AXIA-Enterprises/pdfedit/actions/workflows/build.yml/badge.svg)](https://github.com/AXIA-Enterprises/pdfedit/actions/workflows/build.yml)
@@ -10,38 +10,97 @@ A no-friction desktop PDF editor for macOS, Linux, and Windows. Open a PDF, edit
 
 ![PDFEdit](docs/screenshots/main.png)
 
-## Why this exists
+## What it is
 
-Mainstream PDF editors are heavy, paywalled, or cloud-tied. PDFEdit is a single Python file (`pdfedit.py`) with PyQt6 + PyMuPDF doing the work, packaged as a self-contained PyInstaller bundle on each platform. No accounts, no telemetry, no subscriptions.
+PDFEdit is a desktop PDF editor for people who don't want to fight their tools. Open a PDF (or many — every document gets its own tab), mark it up, edit existing text, build real Acrobat-style forms, reorder pages, watermark, redact, OCR, save. It runs locally on macOS, Linux, and Windows. No cloud, no accounts, no subscription. The whole app is one Python file (`pdfedit.py`, PyQt6 + PyMuPDF) packaged into a self-contained zip per platform.
 
-## Features
+## Highlights
 
-- Open and view multi-page PDFs
-- Add editable text boxes with Google Fonts and common system fonts (Arial, Times New Roman, Calibri, Verdana, Georgia, Tahoma, Trebuchet MS, Courier New, Comic Sans MS, Impact, Arial Black — when installed)
-- Erase text by covering it with a rectangle
-- Signature dialog: typed (cursive) or drawn
-- Watermarks: text, font, size, opacity, rotation, color, page range
-- Highlight, underline, strikeout, sticky-note annotations
-- Page tools: rotate, insert blank, delete, extract a range
-- Find / replace
-- Undo / redo
-- Atomic save (write-temp-then-rename, no half-written PDFs on a crash)
+### Viewing & navigation
+- Multi-document tabs — `Cmd+T` new, `Cmd+W` close, drag to reorder
+- Drop multiple PDFs onto the window and choose Open-each-tab, Merge, or Cancel
+- Password-protected PDFs are detected on open and prompt for the password
+- Editable page-jump spinner with prev/next that disable at boundaries
+- Cursor-anchored zoom (`Cmd+wheel`) and standard `Cmd+`/`Cmd-`/`Cmd+0`
+- Always-visible find box with Match Case, `Ctrl+G` / `Ctrl+Shift+G` for next/previous
 
-## Install — prebuilt binary
+### Annotations & overlays
+- Add Text with configurable font, size, and color (live preview in the dialog)
+- Signatures: type with a cursive Google Font or draw freehand, then drag the corners to resize
+- Highlight, Underline, Strikeout — preview color matches the saved color exactly
+- Sticky Note and Erase (whiteout) for quick redaction
+- Insert Image as a movable, resizable overlay; the image is baked into the PDF only at save time
+- Drawing tools: Pen, Rectangle, Ellipse, Line, Arrow, with a right-click Properties panel for stroke, fill, and width
+- Edit Existing Text — click a line and rewrite it inline; PDFEdit redacts the original glyphs and re-renders with the closest Base14 font match
 
-Download the latest release for your platform from the [Releases page](https://github.com/AXIA-Enterprises/pdfedit/releases):
+### Acrobat-style forms
+- Nine fillable field types: Text, Multi-line Text, Checkbox, Radio Button, Dropdown, List Box, Signature, Date, and Push Button
+- Full Field Properties dialog (right-click any field) with General / Appearance / Options / Actions tabs
+- Real radio groups wired through `/Parent` / `/Kids` xref linking — exactly one button selectable per group
+- Calculations: Sum, Product, Average, Min, Max via embedded JavaScript
+- Format scripts for Number, Date, Zip, Phone, and SSN (`AFNumber_Format`, `AFDate_Format`, `AFSpecial_Format`)
+- Tab Order dialog for setting the keyboard traversal order
+- Form Builder side panel with click-to-focus, drag-to-reorder, inline rename, and delete
+- Reset Form and Flatten Form
 
-- `PDFEdit-macos.zip` — unzip and drag to `/Applications`
-- `PDFEdit-linux.zip` — unzip and run `./PDFEdit/PDFEdit`
-- `PDFEdit-windows.zip` — unzip and run `PDFEdit\PDFEdit.exe`
+### Page management
+- Page Thumbnails side panel with drag-drop reorder, click-to-jump, right-click menu for rotate / insert / delete / extract
+- Rotate, Insert Blank (US Letter), Delete page
+- Crop Pages — current page, all pages, or a range; mediabox-clamped, with a `Pages → Reset Crop` to undo
+- Watermark dialog with live preview, color, opacity, rotation, and per-range targeting
+- Page Numbers dialog: position, format presets, font size, starting number, optional skip-first-page
+- Bates Numbering dialog: prefix, suffix, padding, start, position, font, color
+- Split PDF: by page ranges, every N pages, or by top-level bookmarks, with a templated output filename
+- Compress PDF: Low / Medium / High image-quality presets (JPEG re-encode plus downsample) with before/after size estimates
+- Extract Pages and Merge PDFs
+- Protect PDF: AES-256, separate owner and user passwords, granular permissions
+- Unlock PDF: saves an unencrypted copy
+- Recognize Text / OCR via Tesseract, ten languages, optional dependency with a graceful "not installed" message
 
-**macOS Gatekeeper note.** The macOS build is unsigned. On first launch, macOS will refuse to open it. Either right-click the app and choose Open, or run:
+### Look & feel
+- Light and dark themes (60/30/10 grey + blue accent) that follow macOS System color scheme live
+- Preferences dialog (`Cmd+,`) for theme, UI font size, accent color picker, editor toggles, with Reset and Reset all
+- Toolbar overflow chevron (»  button) that pops out hidden tools when the window is narrow
+- Two collapsible side docks (Pages thumbnails on the left, Form Fields on the right) with toolbar toggles
+- `Edit → Format` submenu for Bold / Italic / Underline / Strikeout / Color / Size+ / Size−
 
-```sh
-xattr -d com.apple.quarantine /Applications/PDFEdit.app
-```
+### Robustness
+- 355 pytest tests, all green
+- Atomic saves — write-temp-then-rename, with bake failures surfaced rather than swallowed
+- Undo / redo via byte-snapshot stack
+- Recent files (case-insensitive on macOS), persisted with `QSettings`
+- Dirty-tab close confirmation; quitting the app walks every dirty tab in order
 
-## Install — from source
+## Screenshots
+
+<!-- Drop screenshots into docs/screenshots/ to fill these in. -->
+
+![Main window](docs/screenshots/main.png)
+
+![Form Builder panel](docs/screenshots/form-builder.png)
+
+![Field properties dialog](docs/screenshots/field-properties.png)
+
+![Page thumbnails dock](docs/screenshots/page-thumbnails.png)
+
+![Watermark dialog](docs/screenshots/watermark.png)
+
+![Preferences](docs/screenshots/preferences.png)
+
+## Install
+
+### Prebuilt binary
+
+Grab the latest release for your platform from the [Releases page](https://github.com/AXIA-Enterprises/pdfedit/releases):
+
+- **macOS** — download `PDFEdit-macos.zip`, unzip, drag `PDFEdit.app` to `/Applications`. The build is unsigned, so on first launch right-click → Open, or run:
+  ```sh
+  xattr -d com.apple.quarantine /Applications/PDFEdit.app
+  ```
+- **Windows** — download `PDFEdit-windows.zip`, unzip, run `PDFEdit\PDFEdit.exe`. No installer.
+- **Linux** — download `PDFEdit-linux.zip`, unzip, run `./PDFEdit/PDFEdit`.
+
+### From source
 
 PDFEdit needs Python 3.11 or newer.
 
@@ -54,7 +113,24 @@ pip install -r requirements.txt
 python pdfedit.py
 ```
 
-## Build a standalone bundle
+### Optional: OCR (Tesseract)
+
+OCR uses [Tesseract](https://github.com/tesseract-ocr/tesseract). Install it once on your system; PDFEdit will pick it up. If Tesseract isn't installed, the OCR menu item shows a friendly message instead of crashing.
+
+```sh
+# macOS
+brew install tesseract
+
+# Debian / Ubuntu
+sudo apt install tesseract-ocr
+
+# Windows (Chocolatey)
+choco install tesseract
+```
+
+For non-English OCR, install the matching language pack (`tesseract-ocr-fra`, `tesseract-ocr-deu`, etc.).
+
+## Build from source
 
 The build scripts produce a single zip per platform.
 
@@ -63,16 +139,33 @@ The build scripts produce a single zip per platform.
 build.bat         # Windows (Command Prompt or PowerShell)
 ```
 
-Output: `PDFEdit-macos.zip`, `PDFEdit-linux.zip`, `PDFEdit-windows.zip`.
+The script drops a runnable `PDFEdit.app` (macOS) or `PDFEdit/` directory (Linux/Windows) next to the source, then zips it as `PDFEdit-macos.zip` / `PDFEdit-linux.zip` / `PDFEdit-windows.zip`.
 
-## Run the tests
+## Keyboard shortcuts
+
+| Action | Shortcut |
+|---|---|
+| New tab | `Cmd+T` |
+| Close tab | `Cmd+W` |
+| Open file | `Cmd+O` |
+| Save | `Cmd+S` |
+| Save As | `Cmd+Shift+S` |
+| Find | `Cmd+F` |
+| Find next / previous | `Ctrl+G` / `Ctrl+Shift+G` |
+| Undo / redo | `Cmd+Z` / `Cmd+Y` |
+| Zoom in / out / reset | `Cmd+`+ / `Cmd+`- / `Cmd+0` |
+| Preferences | `Cmd+,` |
+
+(On Windows and Linux, `Cmd` is `Ctrl`.)
+
+## Tests
 
 ```sh
 pip install pytest pytest-qt
 pytest tests/
 ```
 
-The suite uses pytest-qt and runs headlessly via the offscreen Qt platform (set automatically by `tests/conftest.py`). On a headless machine you can also set it explicitly:
+The suite is 355 tests and runs headlessly via the offscreen Qt platform (set automatically by `tests/conftest.py`). On a headless machine you can also set it explicitly:
 
 ```sh
 QT_QPA_PLATFORM=offscreen pytest tests/
@@ -87,17 +180,7 @@ QT_QPA_PLATFORM=offscreen pytest tests/
 
 ## Network behavior
 
-PDFEdit fetches Google Fonts on demand the first time you select a non-builtin family in the font picker. It downloads from `fonts.googleapis.com` (CSS) and `fonts.gstatic.com` (the TTF), then caches the result under `~/.pdfedit/fonts/`. Both hostnames are validated and the download is capped at 10 MB. There is no other network use — no telemetry, no analytics, no cloud sync.
-
-## Architecture
-
-PDFEdit is a single file by design.
-
-- `pdfedit.py` (~2800 lines) — `_PDFApp` (QApplication subclass, handles macOS FileOpen events), `MainWindow`, `PDFView` (QGraphicsView for the page canvas), `TextBoxItem` (editable QGraphicsTextItem that bakes back into the PDF on save), `SignatureDialog`, `WatermarkDialog`, font helpers, PyMuPDF baking
-- `make_icon.py` — regenerates `PDFEdit.icns` from `icon_master.png` (macOS only)
-- `tests/test_smoke.py` — pytest-qt smoke tests for the core flows
-- `build.sh` / `build.bat` — PyInstaller wrappers per platform
-- `.github/workflows/build.yml` — CI: tests on every push and pull request, multi-platform build on `v*` tags
+PDFEdit fetches Google Fonts on demand the first time you select a non-builtin family in the font picker, with a threaded prefetch in the background and on-demand fallback if the prefetch hasn't finished. It downloads from `fonts.googleapis.com` (CSS) and `fonts.gstatic.com` (the TTF), then caches the result under `~/.pdfedit/fonts/`. Both hostnames are validated and the download is capped at 10 MB. There is no other network use — no telemetry, no analytics, no cloud sync.
 
 ## Contributing
 
@@ -115,4 +198,5 @@ PDFEdit is released under [AGPL-3.0](LICENSE). PDFEdit links [PyMuPDF](https://p
 
 - [PyMuPDF](https://pymupdf.readthedocs.io/) — the PDF rendering and writing engine
 - [PyQt6](https://www.riverbankcomputing.com/software/pyqt/) — the GUI toolkit
+- [Tesseract](https://github.com/tesseract-ocr/tesseract) — the OCR engine
 - [Google Fonts](https://fonts.google.com/) — the on-demand font catalog
