@@ -750,23 +750,24 @@ QToolButton:pressed, QToolButton:checked {{
 }}
 QToolBar#InAppMenuBar QToolButton::menu-indicator {{ image: none; width: 0px; }}
 
-/* Make the auto-inserted toolbar overflow chevron visible against the
-   dark theme. Qt's default SP_ToolBarHorizontalExtensionButton pixmap
-   is rendered nearly invisible against a dark surface, so swap it for
-   a themed text glyph. */
-QToolButton#qt_toolbar_ext_button {{
-    qproperty-text: "\\00bb";
-    qproperty-toolButtonStyle: ToolButtonTextOnly;
+/* Custom always-visible toolbar overflow chevron. Qt's auto-inserted
+   extension button (qt_toolbar_ext_button) is hidden in code; we render
+   our own QToolButton with objectName PdfEditChevron. */
+QToolButton#PdfEditChevron {{
     color: {p['text']};
-    font-size: 16pt;
-    font-weight: 600;
-    padding: 2px 10px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    font-size: 18pt;
+    font-weight: 700;
+    padding: 0px 10px;
 }}
-QToolButton#qt_toolbar_ext_button:hover {{
+QToolButton#PdfEditChevron:hover {{
     background-color: {p['surface-2']};
     border-color: {p['border']};
     color: {p['accent']};
 }}
+QToolButton#PdfEditChevron::menu-indicator {{ image: none; width: 0px; }}
 
 /* ---- Menu bar / Menus ---- */
 QMenuBar {{
@@ -1189,26 +1190,80 @@ def _read_form_panel_default_visible() -> bool:
 
 
 class _OverflowVisibleToolBar(QToolBar):
-    """QToolBar that paints its overflow chevron as a visible » glyph.
+    """QToolBar with an explicit ``»`` overflow button.
 
-    Qt's auto-inserted extension button draws an arrow via QStyle's
-    SP_ToolBarHorizontalExtensionButton pixmap; on a dark theme that pixmap
-    renders dark-on-dark and is effectively invisible. QSS qproperty-text
-    is ignored because the button uses arrowType, not text. We intercept
-    after every resize and force the button into ToolButtonTextOnly mode
-    with a clear glyph and arrow disabled.
+    Qt's auto-inserted extension button draws via QStyle and was rendering
+    invisible against the dark theme. Instead of fighting it, we install
+    our own always-present QToolButton at the right edge whose menu lists
+    every action whose widget can't fit (or is hidden by Qt's own
+    overflow mechanism). The button only shows when at least one action
+    overflows.
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._chevron = QToolButton(self)
+        self._chevron.setObjectName("PdfEditChevron")
+        self._chevron.setText("»")
+        self._chevron.setToolTip("More tools")
+        self._chevron.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self._chevron.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._chevron.setAutoRaise(True)
+        self._chevron_menu = QMenu(self._chevron)
+        self._chevron_menu.aboutToShow.connect(self._populate_chevron_menu)
+        self._chevron.setMenu(self._chevron_menu)
+        self._chevron.hide()
+        # Keep our own chevron pinned on every resize/layout pass.
+        self._reposition_pending = False
+
+    def _populate_chevron_menu(self) -> None:
+        self._chevron_menu.clear()
+        right_edge = self.width() - self._chevron.width() - 6
+        for action in self.actions():
+            widget = self.widgetForAction(action)
+            if widget is None:
+                continue
+            if widget is self._chevron:
+                continue
+            geom = widget.geometry()
+            # Action overflows if its widget is not visible (Qt hid it for
+            # the built-in extension menu) or its right edge sits past
+            # where our own chevron starts.
+            if not widget.isVisible() or geom.right() > right_edge:
+                if action.text() or action.menu() is not None:
+                    self._chevron_menu.addAction(action)
+                elif isinstance(widget, QToolButton) and widget.text():
+                    self._chevron_menu.addAction(widget.text())
+
+    def _has_overflow(self) -> bool:
+        right_edge = self.width()
+        for action in self.actions():
+            widget = self.widgetForAction(action)
+            if widget is None or widget is self._chevron:
+                continue
+            geom = widget.geometry()
+            if not widget.isVisible() or geom.right() > right_edge:
+                return True
+        return False
 
     def resizeEvent(self, ev):  # type: ignore[override]
         super().resizeEvent(ev)
+        # Pin our chevron at the right edge of the toolbar, vertically centered.
+        h = self.height()
+        cw = self._chevron.sizeHint().width()
+        ch = self._chevron.sizeHint().height()
+        self._chevron.setGeometry(self.width() - cw - 4, max(0, (h - ch) // 2), cw, ch)
+        self._chevron.raise_()
+        if self._has_overflow():
+            self._chevron.show()
+        else:
+            self._chevron.hide()
+        # Also kill Qt's invisible default extension button so it doesn't
+        # eat clicks meant for our chevron.
         ext = self.findChild(QToolButton, "qt_toolbar_ext_button")
-        if ext is None:
-            return
-        if not ext.property("_pdfedit_styled"):
-            ext.setArrowType(Qt.ArrowType.NoArrow)
-            ext.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-            ext.setText("»")
-            ext.setProperty("_pdfedit_styled", True)
+        if ext is not None:
+            ext.hide()
+            ext.setMaximumWidth(0)
 
 
 class SettingsDialog(QDialog):
