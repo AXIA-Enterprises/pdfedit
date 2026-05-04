@@ -6981,6 +6981,33 @@ class EditTextPopup(QLineEdit):
             QTimer.singleShot(100, self._commit)
 
 
+class DocumentTab(QWidget):
+    """Per-document state container. Owns a PDFView and tracks the
+    file path, dirty flag, undo/redo stacks, and search state for one tab.
+    """
+
+    def __init__(self, window: "MainWindow"):
+        super().__init__()
+        self.window_ = window
+        self.path: str | None = None
+        self.dirty: bool = False
+        self._undo: list[tuple] = []
+        self._redo: list[tuple] = []
+        self._search_results: list[tuple[int, "fitz.Rect"]] = []
+        self._search_idx: int = -1
+        self._search_query: str = ""
+        self._search_case: bool = False
+
+        self.view = PDFView(window)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self.view)
+
+    def display_name(self) -> str:
+        return os.path.basename(self.path) if self.path else "Untitled"
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -6988,29 +7015,246 @@ class MainWindow(QMainWindow):
         self.resize(1100, 850)
         self.setAcceptDrops(True)
 
-        self.path: str | None = None
-        self.dirty = False
-        self._undo: list[bytes] = []
-        self._redo: list[bytes] = []
-        # Search state
-        self._search_results: list[tuple[int, fitz.Rect]] = []
-        self._search_idx = -1
-        self._search_query = ""
-        self._search_case = False
+        self.tabs = QTabWidget(self)
+        self.tabs.setMovable(True)
+        self.tabs.setTabsClosable(True)
+        self.tabs.setDocumentMode(True)
+        self.tabs.tabCloseRequested.connect(self._on_tab_close_requested)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        self.setCentralWidget(self.tabs)
 
-        self.view = PDFView(self)
-        self.setCentralWidget(self.view)
+        # Seed with one empty tab so self.view is always valid.
+        self._add_initial_tab()
+
         self.setStatusBar(QStatusBar())
         self._build_toolbar()
         self._build_thumbnails_panel()
         self._build_form_panel()
+        self._install_tab_shortcuts()
         self.statusBar().showMessage("Open a PDF to begin (⌘O) — or drop one onto the window")
+
+    # --- Tab management ---
+    def _add_initial_tab(self) -> "DocumentTab":
+        tab = DocumentTab(self)
+        self.tabs.addTab(tab, "Untitled")
+        self.tabs.setCurrentWidget(tab)
+        return tab
+
+    def _install_tab_shortcuts(self):
+        self.act_new_tab = QAction("New Tab", self)
+        self.act_new_tab.setShortcut("Ctrl+T")
+        self.act_new_tab.triggered.connect(self.new_tab)
+        self.addAction(self.act_new_tab)
+
+        self.act_close_tab = QAction("Close Tab", self)
+        self.act_close_tab.setShortcut("Ctrl+W")
+        self.act_close_tab.triggered.connect(self.close_current_tab)
+        self.addAction(self.act_close_tab)
+
+    @property
+    def current_tab(self) -> "DocumentTab | None":
+        w = self.tabs.currentWidget() if hasattr(self, "tabs") else None
+        return w if isinstance(w, DocumentTab) else None
+
+    def all_tabs(self) -> list["DocumentTab"]:
+        out: list[DocumentTab] = []
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, DocumentTab):
+                out.append(w)
+        return out
+
+    # --- Per-tab attribute delegation ---
+    @property
+    def view(self):
+        t = self.current_tab
+        return t.view if t is not None else None
+
+    @property
+    def path(self):
+        t = self.current_tab
+        return t.path if t is not None else None
+
+    @path.setter
+    def path(self, value):
+        t = self.current_tab
+        if t is not None:
+            t.path = value
+
+    @property
+    def dirty(self):
+        t = self.current_tab
+        return bool(t.dirty) if t is not None else False
+
+    @dirty.setter
+    def dirty(self, value):
+        t = self.current_tab
+        if t is not None:
+            t.dirty = bool(value)
+
+    @property
+    def _undo(self):
+        t = self.current_tab
+        return t._undo if t is not None else []
+
+    @_undo.setter
+    def _undo(self, value):
+        t = self.current_tab
+        if t is not None:
+            t._undo = value
+
+    @property
+    def _redo(self):
+        t = self.current_tab
+        return t._redo if t is not None else []
+
+    @_redo.setter
+    def _redo(self, value):
+        t = self.current_tab
+        if t is not None:
+            t._redo = value
+
+    @property
+    def _search_results(self):
+        t = self.current_tab
+        return t._search_results if t is not None else []
+
+    @_search_results.setter
+    def _search_results(self, value):
+        t = self.current_tab
+        if t is not None:
+            t._search_results = value
+
+    @property
+    def _search_idx(self):
+        t = self.current_tab
+        return t._search_idx if t is not None else -1
+
+    @_search_idx.setter
+    def _search_idx(self, value):
+        t = self.current_tab
+        if t is not None:
+            t._search_idx = value
+
+    @property
+    def _search_query(self):
+        t = self.current_tab
+        return t._search_query if t is not None else ""
+
+    @_search_query.setter
+    def _search_query(self, value):
+        t = self.current_tab
+        if t is not None:
+            t._search_query = value
+
+    @property
+    def _search_case(self):
+        t = self.current_tab
+        return t._search_case if t is not None else False
+
+    @_search_case.setter
+    def _search_case(self, value):
+        t = self.current_tab
+        if t is not None:
+            t._search_case = bool(value)
+
+    # --- Tab UI helpers ---
+    def _tab_label_for(self, tab: "DocumentTab") -> str:
+        name = tab.display_name()
+        return f"{name} •" if tab.dirty else name
+
+    def _refresh_tab_label(self, tab: "DocumentTab | None" = None) -> None:
+        tab = tab or self.current_tab
+        if tab is None:
+            return
+        idx = self.tabs.indexOf(tab)
+        if idx < 0:
+            return
+        self.tabs.setTabText(idx, self._tab_label_for(tab))
+        self.tabs.setTabToolTip(idx, tab.path or "Untitled")
+
+    def _on_tab_changed(self, _idx: int) -> None:
+        if not hasattr(self, "form_panel"):
+            return
+        self._refresh_title()
+        try:
+            self._refresh_page_label()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "find_status"):
+                n = len(self._search_results)
+                if n > 0 and self._search_idx >= 0:
+                    self.find_status.setText(f"{self._search_idx + 1} / {n}")
+                else:
+                    self.find_status.setText("")
+        except Exception:
+            pass
+        try:
+            self._refresh_form_panel()
+        except Exception:
+            pass
+        try:
+            self._refresh_thumbnails_panel()
+        except Exception:
+            pass
+
+    def _on_tab_close_requested(self, idx: int) -> None:
+        w = self.tabs.widget(idx)
+        if not isinstance(w, DocumentTab):
+            return
+        if not self._confirm_discard_tab(w):
+            return
+        self.tabs.removeTab(idx)
+        try:
+            if w.view.doc is not None:
+                w.view.doc.close()
+        except Exception:
+            pass
+        w.deleteLater()
+        if self.tabs.count() == 0:
+            self._add_initial_tab()
+            self._on_tab_changed(0)
+
+    def _confirm_discard_tab(self, tab: "DocumentTab") -> bool:
+        if not tab.dirty:
+            return True
+        prev = self.tabs.currentWidget()
+        if prev is not tab:
+            self.tabs.setCurrentWidget(tab)
+        choice = QMessageBox.question(
+            self,
+            "Unsaved changes",
+            f"Save changes to {tab.display_name()} before closing?",
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save,
+        )
+        if choice == QMessageBox.StandardButton.Save:
+            self.save_pdf()
+            return not tab.dirty
+        if choice == QMessageBox.StandardButton.Discard:
+            return True
+        return False
+
+    def new_tab(self) -> "DocumentTab":
+        tab = DocumentTab(self)
+        self.tabs.addTab(tab, "Untitled")
+        self.tabs.setCurrentWidget(tab)
+        return tab
+
+    def close_current_tab(self):
+        idx = self.tabs.currentIndex()
+        if idx >= 0:
+            self._on_tab_close_requested(idx)
 
     # --- Title / dirty tracking ---
     def _refresh_title(self):
         name = os.path.basename(self.path) if self.path else "Untitled"
         mark = " •" if self.dirty else ""
         self.setWindowTitle(f"Basic PDF Editor — {name}{mark}")
+        self._refresh_tab_label()
 
     def _mark_dirty(self):
         self.dirty = True
@@ -7710,8 +7954,6 @@ class MainWindow(QMainWindow):
         if not pdf_paths:
             return
         if len(pdf_paths) == 1:
-            if not self._confirm_discard_changes():
-                return
             self.open_path(pdf_paths[0])
             ev.acceptProposedAction()
             return
@@ -7720,10 +7962,10 @@ class MainWindow(QMainWindow):
         box.setWindowTitle("Multiple PDFs dropped")
         box.setText(f"You dropped {len(pdf_paths)} PDFs. What would you like to do?")
         first_btn = box.addButton(
-            "Open first file only", QMessageBox.ButtonRole.AcceptRole
+            "Open each in its own tab", QMessageBox.ButtonRole.AcceptRole
         )
         merge_btn = box.addButton(
-            "Merge all", QMessageBox.ButtonRole.AcceptRole
+            "Merge all into one tab", QMessageBox.ButtonRole.AcceptRole
         )
         cancel_btn = box.addButton(QMessageBox.StandardButton.Cancel)
         box.setDefaultButton(first_btn)
@@ -7732,43 +7974,51 @@ class MainWindow(QMainWindow):
         if clicked is cancel_btn or clicked is None:
             return
         if clicked is first_btn:
-            if not self._confirm_discard_changes():
-                return
-            self.open_path(pdf_paths[0])
+            for p in pdf_paths:
+                self.open_path(p)
             ev.acceptProposedAction()
             return
         if clicked is merge_btn:
-            if not self._confirm_discard_changes():
-                return
             self.open_path(pdf_paths[0])
-            if self.view.doc is not None:
+            if self.view is not None and self.view.doc is not None:
                 self.merge_pdfs(paths=pdf_paths[1:])
             ev.acceptProposedAction()
             return
 
     # --- Close warning ---
-    def closeEvent(self, ev):
-        if not self.dirty:
-            return super().closeEvent(ev)
-        choice = QMessageBox.question(
-            self,
-            "Unsaved changes",
-            "You have unsaved changes. Save before closing?",
-            QMessageBox.StandardButton.Save
-            | QMessageBox.StandardButton.Discard
-            | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Save,
-        )
-        if choice == QMessageBox.StandardButton.Save:
-            self.save_pdf()
-            if self.dirty:
+    def _prompt_close_dirty_tabs(self, ev) -> None:
+        """Walk every dirty tab and prompt save/discard/cancel.
+        Accept the event if the user resolved every prompt; otherwise ignore.
+        """
+        dirty_tabs = [t for t in self.all_tabs() if t.dirty]
+        if not dirty_tabs:
+            ev.accept()
+            return
+        for tab in dirty_tabs:
+            self.tabs.setCurrentWidget(tab)
+            choice = QMessageBox.question(
+                self,
+                "Unsaved changes",
+                f"Save changes to {tab.display_name()} before closing?",
+                QMessageBox.StandardButton.Save
+                | QMessageBox.StandardButton.Discard
+                | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Save,
+            )
+            if choice == QMessageBox.StandardButton.Save:
+                self.save_pdf()
+                if tab.dirty:
+                    ev.ignore()
+                    return
+            elif choice == QMessageBox.StandardButton.Discard:
+                continue
+            else:
                 ev.ignore()
                 return
-            ev.accept()
-        elif choice == QMessageBox.StandardButton.Discard:
-            ev.accept()
-        else:
-            ev.ignore()
+        ev.accept()
+
+    def closeEvent(self, ev):
+        self._prompt_close_dirty_tabs(ev)
 
     # --- file ops ---
     def _confirm_discard_changes(self) -> bool:
@@ -7792,8 +8042,6 @@ class MainWindow(QMainWindow):
         return False
 
     def new_pdf(self):
-        if not self._confirm_discard_changes():
-            return
         dlg = NewPDFDialog(self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -7805,20 +8053,24 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "New PDF failed", str(exc))
             return
-        self.view.clear_overlays()
-        if self.view.doc:
-            self.view.doc.close()
-        self.view.doc = doc
-        self.view.page_idx = 0
-        self.view.render_all()
-        self.path = None
-        self._undo.clear()
-        self._redo.clear()
-        self._search_results.clear()
-        self._search_idx = -1
-        self.find_status.setText("")
+        target = self.current_tab
+        if target is None or target.view.doc is not None or target.path is not None or target.dirty:
+            target = self.new_tab()
+        target.view.clear_overlays()
+        if target.view.doc:
+            target.view.doc.close()
+        target.view.doc = doc
+        target.view.page_idx = 0
+        target.view.render_all()
+        target.path = None
+        target._undo.clear()
+        target._redo.clear()
+        target._search_results.clear()
+        target._search_idx = -1
+        if self.current_tab is target:
+            self.find_status.setText("")
         # Untitled new doc starts dirty so close prompts to save.
-        self.dirty = True
+        target.dirty = True
         self._refresh_title()
         self._refresh_page_label()
         self._refresh_form_panel()
@@ -7828,16 +8080,22 @@ class MainWindow(QMainWindow):
         )
 
     def open_pdf(self):
-        if not self._confirm_discard_changes():
-            return
         path, _ = QFileDialog.getOpenFileName(self, "Open PDF", "", "PDF Files (*.pdf)")
         if path:
             self.open_path(path)
 
     def open_path(self, path: str):
+        # Open into a new tab unless the current tab is empty (no doc, no path).
+        target = self.current_tab
+        created_new = False
+        if target is None or target.view.doc is not None or target.path is not None or target.dirty:
+            target = self.new_tab()
+            created_new = True
         try:
-            ok = self.view.load(path)
+            ok = target.view.load(path)
         except Exception as exc:
+            if created_new:
+                self._discard_tab(target)
             msg = str(exc)
             is_corrupt = isinstance(exc, getattr(fitz, "FileDataError", ())) or \
                 "cannot open broken document" in msg.lower() or \
@@ -7853,19 +8111,37 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Error", f"Could not open PDF:\n{msg}")
             return
         if not ok:
+            if created_new:
+                self._discard_tab(target)
             return
-        self.path = path
-        self._undo.clear()
-        self._redo.clear()
-        self._search_results.clear()
-        self._search_idx = -1
-        self.find_status.setText("")
-        self._mark_clean()
+        target.path = path
+        target._undo.clear()
+        target._redo.clear()
+        target._search_results.clear()
+        target._search_idx = -1
+        target.dirty = False
+        if self.current_tab is target:
+            self.find_status.setText("")
+        self._refresh_title()
         self._refresh_page_label()
         self._add_recent(path)
         self._refresh_form_panel()
         self._refresh_thumbnails_panel()
         self.statusBar().showMessage(f"Opened {path}")
+
+    def _discard_tab(self, tab: "DocumentTab") -> None:
+        idx = self.tabs.indexOf(tab)
+        if idx < 0:
+            return
+        self.tabs.removeTab(idx)
+        try:
+            if tab.view.doc is not None:
+                tab.view.doc.close()
+        except Exception:
+            pass
+        tab.deleteLater()
+        if self.tabs.count() == 0:
+            self._add_initial_tab()
 
     # --- Recent files ---
     _RECENT_MAX = 10
