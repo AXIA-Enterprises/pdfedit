@@ -2700,6 +2700,311 @@ def _compress_fmt_bytes(n: int) -> str:
     return f"{n / (1024 * 1024):.2f} MB"
 
 
+# PDF permission bits — values per the PDF spec (ISO 32000), exposed by
+# PyMuPDF as fitz.PDF_PERM_*. We resolve them lazily with a fallback so the
+# module loads on builds where any constant is missing.
+def _perm(name: str, default: int) -> int:
+    return int(getattr(fitz, name, default))
+
+
+PDF_PERM_PRINT = _perm("PDF_PERM_PRINT", 0x004)
+PDF_PERM_MODIFY = _perm("PDF_PERM_MODIFY", 0x008)
+PDF_PERM_COPY = _perm("PDF_PERM_COPY", 0x010)
+PDF_PERM_ANNOTATE = _perm("PDF_PERM_ANNOTATE", 0x020)
+PDF_PERM_FORM = _perm("PDF_PERM_FORM", 0x100)
+PDF_PERM_ACCESSIBILITY = _perm("PDF_PERM_ACCESSIBILITY", 0x200)
+PDF_PERM_ASSEMBLE = _perm("PDF_PERM_ASSEMBLE", 0x400)
+PDF_PERM_PRINT_HQ = _perm("PDF_PERM_PRINT_HQ", 0x800)
+PDF_ENCRYPT_AES_256 = _perm("PDF_ENCRYPT_AES_256", 6)
+
+
+class ProtectPdfDialog(QDialog):
+    """Configure password protection + permissions for a PDF save."""
+
+    OUTPUT_NEW = "new"
+    OUTPUT_REPLACE = "replace"
+
+    PERMISSION_FIELDS: list[tuple[str, str, int]] = [
+        ("printing", "Allow printing", PDF_PERM_PRINT),
+        ("modify", "Allow modifying contents", PDF_PERM_MODIFY),
+        ("copy", "Allow copying text/images", PDF_PERM_COPY),
+        ("form", "Allow form filling", PDF_PERM_FORM),
+        ("annotate", "Allow annotations", PDF_PERM_ANNOTATE),
+        ("assemble", "Allow assembling pages", PDF_PERM_ASSEMBLE),
+        ("print_hq", "Allow high-resolution printing", PDF_PERM_PRINT_HQ),
+    ]
+
+    def __init__(self, parent=None, *, source_path: str | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Protect PDF")
+        self.setMinimumWidth(440)
+
+        self._source_path = source_path
+        if source_path:
+            stem, ext = os.path.splitext(source_path)
+            self._default_output = f"{stem}_protected{ext or '.pdf'}"
+        else:
+            self._default_output = ""
+        self._output_path = self._default_output
+
+        self.owner_edit = QLineEdit()
+        self.owner_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.owner_confirm = QLineEdit()
+        self.owner_confirm.setEchoMode(QLineEdit.EchoMode.Password)
+
+        self.user_edit = QLineEdit()
+        self.user_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.user_confirm = QLineEdit()
+        self.user_confirm.setEchoMode(QLineEdit.EchoMode.Password)
+
+        self.perm_checks: dict[str, QCheckBox] = {}
+        for key, label, _bit in self.PERMISSION_FIELDS:
+            cb = QCheckBox(label)
+            cb.setChecked(True)
+            self.perm_checks[key] = cb
+
+        self.rb_new = QRadioButton("Save as new file")
+        self.rb_replace = QRadioButton("Replace original")
+        self.rb_new.setChecked(True)
+        self._out_group = QButtonGroup(self)
+        self._out_group.addButton(self.rb_new, 0)
+        self._out_group.addButton(self.rb_replace, 1)
+        self.rb_new.toggled.connect(self._on_output_toggled)
+        self.rb_replace.toggled.connect(self._on_output_toggled)
+
+        self.path_label = QLabel(self._output_path or "(no source path)")
+        self.path_label.setWordWrap(True)
+        self.choose_btn = QPushButton("Choose…")
+        self.choose_btn.clicked.connect(self._choose_path)
+
+        self.error_label = QLabel("")
+        self.error_label.setWordWrap(True)
+        self.error_label.setStyleSheet("color: #b00020;")
+
+        self.bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.bb.button(QDialogButtonBox.StandardButton.Ok).setText("Protect")
+        self.bb.accepted.connect(self._on_accept)
+        self.bb.rejected.connect(self.reject)
+
+        pw_form = QFormLayout()
+        pw_form.addRow("Owner password:", self.owner_edit)
+        pw_form.addRow("Confirm owner:", self.owner_confirm)
+        pw_form.addRow("User password (optional):", self.user_edit)
+        pw_form.addRow("Confirm user:", self.user_confirm)
+
+        pw_box = QGroupBox("Passwords")
+        pw_layout = QVBoxLayout(pw_box)
+        pw_layout.addLayout(pw_form)
+
+        perm_box = QGroupBox("Permissions")
+        perm_layout = QVBoxLayout(perm_box)
+        for key, _label, _bit in self.PERMISSION_FIELDS:
+            perm_layout.addWidget(self.perm_checks[key])
+
+        out_box = QGroupBox("Output")
+        out_layout = QVBoxLayout(out_box)
+        out_layout.addWidget(self.rb_new)
+        path_row = QHBoxLayout()
+        path_row.addSpacing(20)
+        path_row.addWidget(self.choose_btn)
+        path_row.addWidget(self.path_label, 1)
+        out_layout.addLayout(path_row)
+        out_layout.addWidget(self.rb_replace)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(pw_box)
+        layout.addWidget(perm_box)
+        layout.addWidget(out_box)
+        layout.addWidget(self.error_label)
+        layout.addWidget(self.bb)
+
+        if not source_path:
+            self.rb_replace.setEnabled(False)
+
+    # ---- output --------------------------------------------------------
+    def output_mode(self) -> str:
+        return self.OUTPUT_REPLACE if self.rb_replace.isChecked() else self.OUTPUT_NEW
+
+    def set_output_mode(self, mode: str) -> None:
+        if mode == self.OUTPUT_REPLACE:
+            self.rb_replace.setChecked(True)
+        else:
+            self.rb_new.setChecked(True)
+
+    def output_path(self) -> str:
+        if self.output_mode() == self.OUTPUT_REPLACE:
+            return self._source_path or ""
+        return self._output_path
+
+    def set_output_path(self, path: str) -> None:
+        self._output_path = path
+        self.path_label.setText(path)
+
+    def _on_output_toggled(self, _checked: bool) -> None:
+        replacing = self.rb_replace.isChecked()
+        self.choose_btn.setEnabled(not replacing)
+        self.path_label.setEnabled(not replacing)
+        if replacing:
+            self.path_label.setText(self._source_path or "(no source path)")
+        else:
+            self.path_label.setText(self._output_path or "(no source path)")
+
+    def _choose_path(self) -> None:
+        start = self._output_path or self._default_output or ""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Protected PDF As", start, "PDF Files (*.pdf)"
+        )
+        if path:
+            if not path.lower().endswith(".pdf"):
+                path += ".pdf"
+            self.set_output_path(path)
+
+    # ---- values --------------------------------------------------------
+    def owner_password(self) -> str:
+        return self.owner_edit.text()
+
+    def user_password(self) -> str:
+        return self.user_edit.text()
+
+    def permissions_bitmask(self) -> int:
+        # PDF_PERM_ACCESSIBILITY is always granted; the dialog doesn't
+        # expose it because revoking screen-reader access is hostile and
+        # not commonly desired.
+        bits = PDF_PERM_ACCESSIBILITY
+        for key, _label, bit in self.PERMISSION_FIELDS:
+            if self.perm_checks[key].isChecked():
+                bits |= bit
+        return bits
+
+    def set_permission(self, key: str, allowed: bool) -> None:
+        if key in self.perm_checks:
+            self.perm_checks[key].setChecked(allowed)
+
+    def validation_error(self) -> str:
+        owner = self.owner_edit.text()
+        owner_c = self.owner_confirm.text()
+        user = self.user_edit.text()
+        user_c = self.user_confirm.text()
+        if not owner:
+            return "Owner password is required."
+        if owner != owner_c:
+            return "Owner passwords do not match."
+        if user != user_c:
+            return "User passwords do not match."
+        return ""
+
+    def _on_accept(self) -> None:
+        err = self.validation_error()
+        if err:
+            self.error_label.setText(err)
+            return
+        self.error_label.setText("")
+        self.accept()
+
+
+class UnlockPdfDialog(QDialog):
+    """Confirm where to write the unencrypted copy of the open PDF."""
+
+    OUTPUT_NEW = "new"
+    OUTPUT_REPLACE = "replace"
+
+    def __init__(self, parent=None, *, source_path: str | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Unlock PDF")
+        self.setMinimumWidth(420)
+
+        self._source_path = source_path
+        if source_path:
+            stem, ext = os.path.splitext(source_path)
+            self._default_output = f"{stem}_unlocked{ext or '.pdf'}"
+        else:
+            self._default_output = ""
+        self._output_path = self._default_output
+
+        self.rb_new = QRadioButton("Save as new file")
+        self.rb_replace = QRadioButton("Replace original")
+        self.rb_new.setChecked(True)
+        self._out_group = QButtonGroup(self)
+        self._out_group.addButton(self.rb_new, 0)
+        self._out_group.addButton(self.rb_replace, 1)
+        self.rb_new.toggled.connect(self._on_output_toggled)
+        self.rb_replace.toggled.connect(self._on_output_toggled)
+
+        self.path_label = QLabel(self._output_path or "(no source path)")
+        self.path_label.setWordWrap(True)
+        self.choose_btn = QPushButton("Choose…")
+        self.choose_btn.clicked.connect(self._choose_path)
+
+        self.bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.bb.button(QDialogButtonBox.StandardButton.Ok).setText("Unlock")
+        self.bb.accepted.connect(self.accept)
+        self.bb.rejected.connect(self.reject)
+
+        out_box = QGroupBox("Output")
+        out_layout = QVBoxLayout(out_box)
+        out_layout.addWidget(self.rb_new)
+        path_row = QHBoxLayout()
+        path_row.addSpacing(20)
+        path_row.addWidget(self.choose_btn)
+        path_row.addWidget(self.path_label, 1)
+        out_layout.addLayout(path_row)
+        out_layout.addWidget(self.rb_replace)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "This will save an unencrypted copy of the document. "
+            "Anyone with the resulting file can open it without a password."
+        ))
+        layout.addWidget(out_box)
+        layout.addWidget(self.bb)
+
+        if not source_path:
+            self.rb_replace.setEnabled(False)
+
+    def output_mode(self) -> str:
+        return self.OUTPUT_REPLACE if self.rb_replace.isChecked() else self.OUTPUT_NEW
+
+    def set_output_mode(self, mode: str) -> None:
+        if mode == self.OUTPUT_REPLACE:
+            self.rb_replace.setChecked(True)
+        else:
+            self.rb_new.setChecked(True)
+
+    def output_path(self) -> str:
+        if self.output_mode() == self.OUTPUT_REPLACE:
+            return self._source_path or ""
+        return self._output_path
+
+    def set_output_path(self, path: str) -> None:
+        self._output_path = path
+        self.path_label.setText(path)
+
+    def _on_output_toggled(self, _checked: bool) -> None:
+        replacing = self.rb_replace.isChecked()
+        self.choose_btn.setEnabled(not replacing)
+        self.path_label.setEnabled(not replacing)
+        if replacing:
+            self.path_label.setText(self._source_path or "(no source path)")
+        else:
+            self.path_label.setText(self._output_path or "(no source path)")
+
+    def _choose_path(self) -> None:
+        start = self._output_path or self._default_output or ""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Unlocked PDF As", start, "PDF Files (*.pdf)"
+        )
+        if path:
+            if not path.lower().endswith(".pdf"):
+                path += ".pdf"
+            self.set_output_path(path)
+
+
 CURSIVE_FONTS = ["Dancing Script", "Pacifico", "Caveat", "Permanent Marker",
                  "Lobster", "Shadows Into Light"]
 
@@ -4353,6 +4658,10 @@ class PDFView(QGraphicsView):
         self.setBackgroundBrush(QBrush(QColor(60, 60, 60)))
 
         self.doc: fitz.Document | None = None
+        # True if the doc was opened from an encrypted file (drives the
+        # "Unlock" menu enable state). Reset by load(); kept as False after
+        # an unprotected New PDF or after Unlock writes a fresh copy.
+        self.was_encrypted: bool = False
         self.page_idx = 0  # current visible page (for status bar)
         self.zoom = 1.6
         self.mode = "select"
@@ -4397,6 +4706,7 @@ class PDFView(QGraphicsView):
             self.doc.close()
             self.doc = None
         doc = fitz.open(path)
+        was_encrypted = bool(doc.needs_pass)
         if doc.needs_pass:
             pwd, ok = QInputDialog.getText(
                 self, "Password required",
@@ -4411,6 +4721,7 @@ class PDFView(QGraphicsView):
                 )
                 return False
         self.doc = doc
+        self.was_encrypted = was_encrypted
         self.page_idx = 0
         self.render_all()
         return True
@@ -7198,6 +7509,22 @@ class MainWindow(QMainWindow):
             self._refresh_thumbnails_panel()
         except Exception:
             pass
+        try:
+            self._refresh_protect_actions()
+        except Exception:
+            pass
+
+    def _refresh_protect_actions(self) -> None:
+        """Enable/disable Unlock based on whether the active doc was opened encrypted."""
+        if not hasattr(self, "act_unlock"):
+            return
+        view = self.view
+        encrypted = bool(view is not None and getattr(view, "was_encrypted", False))
+        self.act_unlock.setEnabled(encrypted)
+        if encrypted:
+            self.act_unlock.setToolTip("Save an unencrypted copy of this PDF")
+        else:
+            self.act_unlock.setToolTip("Document is not protected")
 
     def _on_tab_close_requested(self, idx: int) -> None:
         w = self.tabs.widget(idx)
@@ -7359,6 +7686,10 @@ class MainWindow(QMainWindow):
 
         # Tools (one-shot)
         self.act_watermark = make("Watermark…", self.do_watermark)
+        self.act_protect = make("Protect…", self.open_protect_dialog)
+        self.act_unlock = make("Unlock…", self.open_unlock_dialog)
+        self.act_unlock.setEnabled(False)
+        self.act_unlock.setToolTip("Document is not protected")
         self.act_ocr = make("Recognize Text…", self.run_ocr)
         ok, reason = _check_tesseract_available()
         if not ok:
@@ -7661,6 +7992,7 @@ class MainWindow(QMainWindow):
                        self.act_save, self.act_save_as, None,
                        self.act_merge, self.act_extract, self.act_split,
                        self.act_compress, None,
+                       self.act_unlock, None,
                        self.act_preferences]),
             ("&Edit", [self.act_undo, self.act_redo, None,
                        self.act_find, self.act_find_next, self.act_find_prev,
@@ -7675,7 +8007,7 @@ class MainWindow(QMainWindow):
                          self._crop_tool_action(), self.act_reset_crop]),
             ("&Forms", [*self._form_actions, None, self.act_tab_order,
                         None, self.act_reset_form, self.act_flatten_form]),
-            ("&Tools", [self.act_watermark, self.act_ocr]),
+            ("&Tools", [self.act_watermark, self.act_protect, self.act_ocr]),
         ]
         self._menu_spec = menu_spec
 
@@ -8127,6 +8459,7 @@ class MainWindow(QMainWindow):
         self._add_recent(path)
         self._refresh_form_panel()
         self._refresh_thumbnails_panel()
+        self._refresh_protect_actions()
         self.statusBar().showMessage(f"Opened {path}")
 
     def _discard_tab(self, tab: "DocumentTab") -> None:
@@ -9255,6 +9588,183 @@ class MainWindow(QMainWindow):
         if replacing:
             # Reload the freshly-written file so the editor reflects the
             # compressed streams (matches Save behavior).
+            self.open_path(out_path)
+
+    # ---------------- Protect / Unlock ----------------
+    def open_protect_dialog(self):
+        if not self.view.doc:
+            QMessageBox.information(
+                self, "Protect PDF", "Open or create a PDF first to protect."
+            )
+            return
+        dlg = ProtectPdfDialog(self, source_path=self.path)
+        self._last_protect_dialog = dlg
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._run_protect(dlg)
+
+    def _run_protect(self, dlg: "ProtectPdfDialog") -> None:
+        out_path = dlg.output_path()
+        if not out_path:
+            QMessageBox.warning(
+                self, "Protect PDF",
+                "No output path. Save the PDF first or pick an output file.",
+            )
+            return
+        replacing = dlg.output_mode() == dlg.OUTPUT_REPLACE
+        if replacing:
+            confirm = QMessageBox.question(
+                self, "Protect PDF",
+                "This will overwrite the original file with a password-protected "
+                "copy. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+
+        owner_pw = dlg.owner_password()
+        user_pw = dlg.user_password()
+        perms = dlg.permissions_bitmask()
+
+        tmp_path = out_path + ".tmp"
+        clone, failed = self._bake_to_clone()
+        try:
+            try:
+                clone.save(
+                    tmp_path,
+                    encryption=PDF_ENCRYPT_AES_256,
+                    owner_pw=owner_pw,
+                    user_pw=user_pw or "",
+                    permissions=perms,
+                    garbage=4,
+                    deflate=True,
+                )
+            except Exception as exc:
+                try:
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+                except Exception:
+                    pass
+                QMessageBox.critical(
+                    self, "Protect PDF", f"Could not protect PDF:\n{exc}"
+                )
+                return
+        finally:
+            try:
+                clone.close()
+            except Exception:
+                pass
+
+        if failed:
+            self._report_bake_failures(failed)
+
+        try:
+            os.replace(tmp_path, out_path)
+        except Exception as exc:
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except Exception:
+                pass
+            QMessageBox.critical(
+                self, "Protect PDF", f"Could not write output:\n{exc}"
+            )
+            return
+
+        out_name = os.path.basename(out_path)
+        QMessageBox.information(
+            self, "Protect PDF",
+            f"Protected PDF written to {out_name}.",
+        )
+        self.statusBar().showMessage(f"Protected: {out_name}")
+
+        if replacing:
+            # Reload — the new file is encrypted, so PDFView.load() will
+            # prompt for a password (the owner_pw the user just set).
+            self.open_path(out_path)
+
+    def open_unlock_dialog(self):
+        if not self.view.doc:
+            QMessageBox.information(
+                self, "Unlock PDF", "Open a protected PDF first."
+            )
+            return
+        if not getattr(self.view, "was_encrypted", False):
+            QMessageBox.information(
+                self, "Unlock PDF", "Document is not protected."
+            )
+            return
+        dlg = UnlockPdfDialog(self, source_path=self.path)
+        self._last_unlock_dialog = dlg
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._run_unlock(dlg)
+
+    def _run_unlock(self, dlg: "UnlockPdfDialog") -> None:
+        out_path = dlg.output_path()
+        if not out_path:
+            QMessageBox.warning(
+                self, "Unlock PDF",
+                "No output path. Pick an output file.",
+            )
+            return
+        replacing = dlg.output_mode() == dlg.OUTPUT_REPLACE
+        if replacing:
+            confirm = QMessageBox.question(
+                self, "Unlock PDF",
+                "This will overwrite the original file with an unencrypted "
+                "copy. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+
+        tmp_path = out_path + ".tmp"
+        clone, failed = self._bake_to_clone()
+        try:
+            try:
+                clone.save(tmp_path, garbage=4, deflate=True)
+            except Exception as exc:
+                try:
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+                except Exception:
+                    pass
+                QMessageBox.critical(
+                    self, "Unlock PDF", f"Could not unlock PDF:\n{exc}"
+                )
+                return
+        finally:
+            try:
+                clone.close()
+            except Exception:
+                pass
+
+        if failed:
+            self._report_bake_failures(failed)
+
+        try:
+            os.replace(tmp_path, out_path)
+        except Exception as exc:
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except Exception:
+                pass
+            QMessageBox.critical(
+                self, "Unlock PDF", f"Could not write output:\n{exc}"
+            )
+            return
+
+        out_name = os.path.basename(out_path)
+        QMessageBox.information(
+            self, "Unlock PDF",
+            f"Unlocked PDF written to {out_name}.",
+        )
+        self.statusBar().showMessage(f"Unlocked: {out_name}")
+
+        if replacing:
+            # Reload — the new file is unencrypted, so no password prompt.
             self.open_path(out_path)
 
     def do_erase(self, page_idx: int, x0, y0, x1, y1):
