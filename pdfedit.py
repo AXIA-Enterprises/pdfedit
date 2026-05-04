@@ -750,6 +750,24 @@ QToolButton:pressed, QToolButton:checked {{
 }}
 QToolBar#InAppMenuBar QToolButton::menu-indicator {{ image: none; width: 0px; }}
 
+/* Make the auto-inserted toolbar overflow chevron visible against the
+   dark theme. Qt's default SP_ToolBarHorizontalExtensionButton pixmap
+   is rendered nearly invisible against a dark surface, so swap it for
+   a themed text glyph. */
+QToolButton#qt_toolbar_ext_button {{
+    qproperty-text: "\\00bb";
+    qproperty-toolButtonStyle: ToolButtonTextOnly;
+    color: {p['text']};
+    font-size: 16pt;
+    font-weight: 600;
+    padding: 2px 10px;
+}}
+QToolButton#qt_toolbar_ext_button:hover {{
+    background-color: {p['surface-2']};
+    border-color: {p['border']};
+    color: {p['accent']};
+}}
+
 /* ---- Menu bar / Menus ---- */
 QMenuBar {{
     background-color: {p['surface']};
