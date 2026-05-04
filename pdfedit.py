@@ -3818,6 +3818,429 @@ class ImageOverlayItem(QGraphicsPixmapItem):
         )
 
 
+class _DrawingResizeHandle(QGraphicsRectItem):
+    """Bottom-right corner handle for resizing any drawing overlay in 2D."""
+
+    SIZE = 10
+
+    def __init__(self, parent):
+        super().__init__(0, 0, self.SIZE, self.SIZE, parent)
+        self.owner = parent
+        self.setBrush(QBrush(QColor(60, 130, 220)))
+        self.setPen(QPen(QColor(255, 255, 255), 1))
+        self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        self.setAcceptHoverEvents(True)
+        self._dragging = False
+        self._press_scene = QPointF(0.0, 0.0)
+        self._initial_pdf_w = 0.0
+        self._initial_pdf_h = 0.0
+        self.hide()
+
+    def mousePressEvent(self, ev):
+        self._dragging = True
+        self._press_scene = ev.scenePos()
+        self._initial_pdf_w = self.owner.pdf_w
+        self._initial_pdf_h = self.owner.pdf_h
+        try:
+            self.owner.view.window_._snapshot()
+        except Exception:
+            pass
+        ev.accept()
+
+    def mouseMoveEvent(self, ev):
+        if not self._dragging:
+            return
+        z = self.owner.view.zoom
+        delta = ev.scenePos() - self._press_scene
+        new_w = max(4.0, self._initial_pdf_w + delta.x() / z)
+        new_h = max(4.0, self._initial_pdf_h + delta.y() / z)
+        self.owner.pdf_w = new_w
+        self.owner.pdf_h = new_h
+        self.owner.refresh()
+        ev.accept()
+
+    def mouseReleaseEvent(self, ev):
+        self._dragging = False
+        try:
+            self.owner.view.window_._mark_dirty()
+        except Exception:
+            pass
+        ev.accept()
+
+
+class _DrawingOverlayMixin:
+    """Shared move/select/resize plumbing for drawing overlays.
+
+    Subclasses provide pdf_x/pdf_y/pdf_w/pdf_h plus a refresh() that builds
+    the QPainterPath, then call _init_drawing_flags() in __init__.
+    """
+
+    def _init_drawing_flags(self):
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsFocusable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsScenePositionChanges, True)
+        self._handle = _DrawingResizeHandle(self)
+
+    def position_handle(self):
+        z = self.view.zoom
+        self._handle.setPos(
+            self.pdf_w * z - _DrawingResizeHandle.SIZE,
+            self.pdf_h * z - _DrawingResizeHandle.SIZE,
+        )
+
+    def boundingRect(self):
+        z = self.view.zoom
+        pad = max(1.0, self.stroke_width * z) / 2 + 2.0
+        return QRectF(-pad, -pad, self.pdf_w * z + 2 * pad, self.pdf_h * z + 2 * pad)
+
+    def paint(self, painter, option, widget=None):
+        super().paint(painter, option, widget)
+        if self.isSelected():
+            painter.save()
+            pen = QPen(QColor(60, 130, 220), 1, Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            z = self.view.zoom
+            painter.drawRect(QRectF(0, 0, self.pdf_w * z, self.pdf_h * z))
+            painter.restore()
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
+            geom = self.view._page_geom
+            if self.page_idx < len(geom):
+                top = geom[self.page_idx][0]
+                z = self.view.zoom
+                p = self.pos()
+                self.pdf_x = (p.x() - PAGE_MARGIN) / z
+                self.pdf_y = (p.y() - top) / z
+                w = self.view.window_
+                if not w.dirty:
+                    w._mark_dirty()
+        elif change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
+            self._handle.setVisible(bool(value))
+            self.view.window_.refresh_format_toolbar()
+        return super().itemChange(change, value)
+
+
+def _qcolor_to_rgbf(c: QColor) -> tuple[float, float, float]:
+    return (c.redF(), c.greenF(), c.blueF())
+
+
+class PenStrokeOverlay(_DrawingOverlayMixin, QGraphicsPathItem):
+    """Freehand pen / scribble overlay. Stores a single polyline in PDF coords."""
+
+    DISPLAY_NAME = "Pen stroke"
+
+    def __init__(self, view, page_idx: int, pdf_points: list[tuple[float, float]],
+                 stroke_color: QColor | None = None,
+                 stroke_width: float = 2.0):
+        super().__init__()
+        self.view = view
+        self.page_idx = page_idx
+        self.stroke_color = stroke_color or current_accent_color()
+        self.stroke_width = float(stroke_width)
+        # Compute bbox from the absolute points; store points as offsets so
+        # itemChange-driven moves only need to update pdf_x/pdf_y.
+        if not pdf_points:
+            pdf_points = [(0.0, 0.0)]
+        xs = [p[0] for p in pdf_points]
+        ys = [p[1] for p in pdf_points]
+        x0, x1 = min(xs), max(xs)
+        y0, y1 = min(ys), max(ys)
+        self.pdf_x = x0
+        self.pdf_y = y0
+        self.pdf_w = max(1.0, x1 - x0)
+        self.pdf_h = max(1.0, y1 - y0)
+        # rel points stored in normalized 0..1 across pdf_w/pdf_h so resize
+        # scales them proportionally to the new bbox.
+        self._rel_points: list[tuple[float, float]] = [
+            (
+                (px - x0) / self.pdf_w if self.pdf_w else 0.0,
+                (py - y0) / self.pdf_h if self.pdf_h else 0.0,
+            )
+            for (px, py) in pdf_points
+        ]
+        self._init_drawing_flags()
+        self.refresh()
+
+    @property
+    def pdf_points(self) -> list[tuple[float, float]]:
+        return [
+            (self.pdf_x + rx * self.pdf_w, self.pdf_y + ry * self.pdf_h)
+            for (rx, ry) in self._rel_points
+        ]
+
+    def refresh(self):
+        if not self.view._page_geom or self.page_idx >= len(self.view._page_geom):
+            return
+        top = self.view._page_geom[self.page_idx][0]
+        z = self.view.zoom
+        self.setPos(PAGE_MARGIN + self.pdf_x * z, top + self.pdf_y * z)
+        path = QPainterPath()
+        w_px = self.pdf_w * z
+        h_px = self.pdf_h * z
+        if self._rel_points:
+            sx, sy = self._rel_points[0]
+            path.moveTo(sx * w_px, sy * h_px)
+            for rx, ry in self._rel_points[1:]:
+                path.lineTo(rx * w_px, ry * h_px)
+        self.setPath(path)
+        pen = QPen(self.stroke_color, max(1.0, self.stroke_width * z))
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        self.setPen(pen)
+        self.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        self.position_handle()
+
+    def to_pdf(self, page):
+        rgb = _qcolor_to_rgbf(self.stroke_color)
+        pts = self.pdf_points
+        if len(pts) < 2:
+            return
+        try:
+            page.draw_polyline(pts, color=rgb, width=self.stroke_width)
+        except Exception:
+            for a, b in zip(pts[:-1], pts[1:]):
+                page.draw_line(a, b, color=rgb, width=self.stroke_width)
+
+    def serialize(self) -> dict:
+        return {
+            "kind": "pen",
+            "page_idx": self.page_idx,
+            "pdf_points": self.pdf_points,
+            "stroke_color": self.stroke_color.name(),
+            "stroke_width": self.stroke_width,
+        }
+
+    @classmethod
+    def deserialize(cls, view, d: dict) -> "PenStrokeOverlay":
+        return cls(
+            view, d["page_idx"],
+            [tuple(p) for p in d.get("pdf_points", [])],
+            stroke_color=QColor(d.get("stroke_color", "#000000")),
+            stroke_width=d.get("stroke_width", 2.0),
+        )
+
+
+class ShapeOverlay(_DrawingOverlayMixin, QGraphicsPathItem):
+    """Rect/ellipse/line/arrow overlay drawn from a bbox."""
+
+    SHAPE_DISPLAY = {
+        "rect": "Rectangle",
+        "ellipse": "Ellipse",
+        "line": "Line",
+        "arrow": "Arrow",
+    }
+
+    def __init__(self, view, page_idx: int, shape: str,
+                 pdf_x: float, pdf_y: float, pdf_w: float, pdf_h: float,
+                 stroke_color: QColor | None = None,
+                 fill_color: QColor | None = None,
+                 stroke_width: float = 2.0):
+        super().__init__()
+        self.view = view
+        self.page_idx = page_idx
+        self.shape = shape
+        self.pdf_x = float(pdf_x)
+        self.pdf_y = float(pdf_y)
+        self.pdf_w = max(1.0, float(pdf_w))
+        self.pdf_h = max(1.0, float(pdf_h))
+        self.stroke_color = stroke_color or current_accent_color()
+        self.fill_color = fill_color  # None = no fill
+        self.stroke_width = float(stroke_width)
+        self._init_drawing_flags()
+        self.refresh()
+
+    @property
+    def DISPLAY_NAME(self) -> str:
+        return self.SHAPE_DISPLAY.get(self.shape, "Shape")
+
+    def refresh(self):
+        if not self.view._page_geom or self.page_idx >= len(self.view._page_geom):
+            return
+        top = self.view._page_geom[self.page_idx][0]
+        z = self.view.zoom
+        self.setPos(PAGE_MARGIN + self.pdf_x * z, top + self.pdf_y * z)
+        w_px = self.pdf_w * z
+        h_px = self.pdf_h * z
+        path = QPainterPath()
+        if self.shape == "rect":
+            path.addRect(0, 0, w_px, h_px)
+        elif self.shape == "ellipse":
+            path.addEllipse(0, 0, w_px, h_px)
+        elif self.shape in ("line", "arrow"):
+            path.moveTo(0, 0)
+            path.lineTo(w_px, h_px)
+            if self.shape == "arrow":
+                head_len = max(8.0, self.stroke_width * 4.0) * z
+                import math
+                ang = math.atan2(h_px, w_px)
+                hx = w_px - head_len * math.cos(ang - math.radians(25))
+                hy = h_px - head_len * math.sin(ang - math.radians(25))
+                hx2 = w_px - head_len * math.cos(ang + math.radians(25))
+                hy2 = h_px - head_len * math.sin(ang + math.radians(25))
+                path.moveTo(w_px, h_px)
+                path.lineTo(hx, hy)
+                path.moveTo(w_px, h_px)
+                path.lineTo(hx2, hy2)
+        self.setPath(path)
+        pen = QPen(self.stroke_color, max(1.0, self.stroke_width * z))
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        self.setPen(pen)
+        if self.fill_color is not None and self.shape in ("rect", "ellipse"):
+            self.setBrush(QBrush(self.fill_color))
+        else:
+            self.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        self.position_handle()
+
+    def to_pdf(self, page):
+        rgb = _qcolor_to_rgbf(self.stroke_color)
+        fill_rgb = _qcolor_to_rgbf(self.fill_color) if self.fill_color is not None else None
+        x0, y0 = self.pdf_x, self.pdf_y
+        x1, y1 = self.pdf_x + self.pdf_w, self.pdf_y + self.pdf_h
+        if self.shape == "rect":
+            page.draw_rect(
+                fitz.Rect(x0, y0, x1, y1),
+                color=rgb, fill=fill_rgb, width=self.stroke_width,
+            )
+        elif self.shape == "ellipse":
+            page.draw_oval(
+                fitz.Rect(x0, y0, x1, y1),
+                color=rgb, fill=fill_rgb, width=self.stroke_width,
+            )
+        elif self.shape == "line":
+            page.draw_line((x0, y0), (x1, y1), color=rgb, width=self.stroke_width)
+        elif self.shape == "arrow":
+            page.draw_line((x0, y0), (x1, y1), color=rgb, width=self.stroke_width)
+            import math
+            head_len = max(8.0, self.stroke_width * 4.0)
+            dx, dy = x1 - x0, y1 - y0
+            ang = math.atan2(dy, dx)
+            hx = x1 - head_len * math.cos(ang - math.radians(25))
+            hy = y1 - head_len * math.sin(ang - math.radians(25))
+            hx2 = x1 - head_len * math.cos(ang + math.radians(25))
+            hy2 = y1 - head_len * math.sin(ang + math.radians(25))
+            page.draw_line((x1, y1), (hx, hy), color=rgb, width=self.stroke_width)
+            page.draw_line((x1, y1), (hx2, hy2), color=rgb, width=self.stroke_width)
+
+    def serialize(self) -> dict:
+        return {
+            "kind": "shape",
+            "shape": self.shape,
+            "page_idx": self.page_idx,
+            "pdf_x": self.pdf_x, "pdf_y": self.pdf_y,
+            "pdf_w": self.pdf_w, "pdf_h": self.pdf_h,
+            "stroke_color": self.stroke_color.name(),
+            "fill_color": self.fill_color.name() if self.fill_color is not None else None,
+            "stroke_width": self.stroke_width,
+        }
+
+    @classmethod
+    def deserialize(cls, view, d: dict) -> "ShapeOverlay":
+        fill = d.get("fill_color")
+        return cls(
+            view, d["page_idx"], d["shape"],
+            d["pdf_x"], d["pdf_y"], d["pdf_w"], d["pdf_h"],
+            stroke_color=QColor(d.get("stroke_color", "#000000")),
+            fill_color=QColor(fill) if fill else None,
+            stroke_width=d.get("stroke_width", 2.0),
+        )
+
+
+class DrawingPropertiesDialog(QDialog):
+    """Edit stroke color, fill color (rect/ellipse), and stroke width for a drawing overlay."""
+
+    def __init__(self, parent, overlay):
+        super().__init__(parent)
+        self.setWindowTitle(f"{getattr(overlay, 'DISPLAY_NAME', 'Drawing')} Properties")
+        self.overlay = overlay
+        self._stroke = QColor(overlay.stroke_color)
+        has_fill_concept = isinstance(overlay, ShapeOverlay) and overlay.shape in ("rect", "ellipse")
+        self._fill: QColor | None = (
+            QColor(overlay.fill_color) if (has_fill_concept and overlay.fill_color is not None) else None
+        )
+        self._has_fill = has_fill_concept
+
+        form = QFormLayout()
+        self.stroke_btn = QPushButton("…")
+        self._refresh_swatch(self.stroke_btn, self._stroke)
+        self.stroke_btn.clicked.connect(self._pick_stroke)
+        form.addRow("Stroke color:", self.stroke_btn)
+
+        if has_fill_concept:
+            self.fill_btn = QPushButton("…")
+            self._refresh_fill_swatch()
+            self.fill_btn.clicked.connect(self._pick_fill)
+            self.fill_clear_btn = QPushButton("None")
+            self.fill_clear_btn.clicked.connect(self._clear_fill)
+            row = QHBoxLayout()
+            row.addWidget(self.fill_btn)
+            row.addWidget(self.fill_clear_btn)
+            row_widget = QWidget()
+            row_widget.setLayout(row)
+            form.addRow("Fill color:", row_widget)
+
+        self.width_spin = QDoubleSpinBox()
+        self.width_spin.setRange(0.25, 32.0)
+        self.width_spin.setSingleStep(0.5)
+        self.width_spin.setValue(overlay.stroke_width)
+        self.width_spin.setSuffix(" pt")
+        form.addRow("Stroke width:", self.width_spin)
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(bb)
+
+    def _refresh_swatch(self, btn: QPushButton, c: QColor) -> None:
+        btn.setStyleSheet(
+            f"QPushButton {{ background: {c.name()}; color: white; padding: 4px 18px; }}"
+        )
+
+    def _refresh_fill_swatch(self) -> None:
+        if self._fill is None:
+            self.fill_btn.setStyleSheet(
+                "QPushButton { background: transparent; color: #888; padding: 4px 18px; }"
+            )
+            self.fill_btn.setText("(none)")
+        else:
+            self._refresh_swatch(self.fill_btn, self._fill)
+            self.fill_btn.setText("…")
+
+    def _pick_stroke(self) -> None:
+        c = QColorDialog.getColor(self._stroke, self, "Stroke color")
+        if c.isValid():
+            self._stroke = c
+            self._refresh_swatch(self.stroke_btn, c)
+
+    def _pick_fill(self) -> None:
+        start = self._fill if self._fill is not None else QColor(255, 255, 255)
+        c = QColorDialog.getColor(start, self, "Fill color")
+        if c.isValid():
+            self._fill = c
+            self._refresh_fill_swatch()
+
+    def _clear_fill(self) -> None:
+        self._fill = None
+        self._refresh_fill_swatch()
+
+    def result_values(self) -> dict:
+        out = {
+            "stroke_color": self._stroke,
+            "stroke_width": float(self.width_spin.value()),
+        }
+        if self._has_fill:
+            out["fill_color"] = self._fill
+        return out
+
+
 class PDFView(QGraphicsView):
     """Renders all PDF pages stacked vertically and dispatches mouse interactions."""
 
@@ -3840,6 +4263,11 @@ class PDFView(QGraphicsView):
         self._start_page: int | None = None
         self._start_pdf: tuple[float, float] | None = None
         self._rubber: QGraphicsRectItem | None = None
+        # Drawing-tool preview state. _draw_preview is a generic QGraphicsItem
+        # (rect/ellipse path/line path) used while dragging. _pen_points holds
+        # the in-progress freehand polyline in PDF coords.
+        self._draw_preview = None
+        self._pen_points: list[tuple[float, float]] = []
         # per-page (top_y_in_scene, bottom_y_in_scene, pdf_width, pdf_height)
         self._page_geom: list[tuple[float, float, float, float]] = []
         # Floating overlay items (TextBoxItem, SignatureItem) — survive render_all()
@@ -4145,6 +4573,33 @@ class PDFView(QGraphicsView):
         self._start_page, sx, sy = loc
         self._start_pdf = (sx, sy)
 
+        if self.mode == "draw-pen":
+            self._pen_points = [(sx, sy)]
+            stroke = self.window_._draw_stroke_color()
+            pen = QPen(stroke, max(1.0, self.window_._draw_stroke_width * self.zoom))
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            preview = QGraphicsPathItem()
+            preview.setPen(pen)
+            path = QPainterPath()
+            path.moveTo(sp)
+            preview.setPath(path)
+            self.scene_.addItem(preview)
+            self._draw_preview = preview
+            return
+
+        if self.mode in ("draw-rect", "draw-ellipse", "draw-line", "draw-arrow"):
+            stroke = self.window_._draw_stroke_color()
+            pen = QPen(stroke, max(1.0, self.window_._draw_stroke_width * self.zoom),
+                       Qt.PenStyle.DashLine)
+            preview = QGraphicsPathItem()
+            preview.setPen(pen)
+            preview.setBrush(Qt.BrushStyle.NoBrush)
+            preview.setPath(QPainterPath())
+            self.scene_.addItem(preview)
+            self._draw_preview = preview
+            return
+
         if self.mode in ("erase", "form-text", "form-check", "highlight",
                           "underline", "strikeout",
                           "add-text", "signature", "image"):
@@ -4169,8 +4624,55 @@ class PDFView(QGraphicsView):
         if self._start_scene is not None and self._rubber is not None:
             cur = self.mapToScene(ev.pos())
             self._rubber.setRect(QRectF(self._start_scene, cur).normalized())
-        else:
-            super().mouseMoveEvent(ev)
+            return
+        if self._start_scene is not None and self._draw_preview is not None:
+            cur = self.mapToScene(ev.pos())
+            mode = self.mode
+            if mode == "draw-pen" and self._start_page is not None:
+                ex, ey = self._project_to_page(cur, self._start_page)
+                last = self._pen_points[-1] if self._pen_points else None
+                if last is None or (abs(ex - last[0]) > 0.25 or abs(ey - last[1]) > 0.25):
+                    self._pen_points.append((ex, ey))
+                top = self._page_geom[self._start_page][0]
+                z = self.zoom
+                path = QPainterPath()
+                first = True
+                for px, py in self._pen_points:
+                    sp = QPointF(PAGE_MARGIN + px * z, top + py * z)
+                    if first:
+                        path.moveTo(sp)
+                        first = False
+                    else:
+                        path.lineTo(sp)
+                self._draw_preview.setPath(path)
+                return
+            r = QRectF(self._start_scene, cur).normalized()
+            path = QPainterPath()
+            if mode == "draw-rect":
+                path.addRect(r)
+            elif mode == "draw-ellipse":
+                path.addEllipse(r)
+            elif mode in ("draw-line", "draw-arrow"):
+                path.moveTo(self._start_scene)
+                path.lineTo(cur)
+                if mode == "draw-arrow":
+                    import math
+                    dx = cur.x() - self._start_scene.x()
+                    dy = cur.y() - self._start_scene.y()
+                    if dx != 0 or dy != 0:
+                        head_len = max(8.0, self.window_._draw_stroke_width * 4.0) * self.zoom
+                        ang = math.atan2(dy, dx)
+                        hx = cur.x() - head_len * math.cos(ang - math.radians(25))
+                        hy = cur.y() - head_len * math.sin(ang - math.radians(25))
+                        hx2 = cur.x() - head_len * math.cos(ang + math.radians(25))
+                        hy2 = cur.y() - head_len * math.sin(ang + math.radians(25))
+                        path.moveTo(cur)
+                        path.lineTo(QPointF(hx, hy))
+                        path.moveTo(cur)
+                        path.lineTo(QPointF(hx2, hy2))
+            self._draw_preview.setPath(path)
+            return
+        super().mouseMoveEvent(ev)
 
     def mouseReleaseEvent(self, ev):
         if (
@@ -4185,6 +4687,10 @@ class PDFView(QGraphicsView):
             if self._rubber is not None:
                 self.scene_.removeItem(self._rubber)
                 self._rubber = None
+            if self._draw_preview is not None:
+                self.scene_.removeItem(self._draw_preview)
+                self._draw_preview = None
+            self._pen_points = []
             return super().mouseReleaseEvent(ev)
 
         end_scene = self.mapToScene(ev.pos())
@@ -4199,7 +4705,12 @@ class PDFView(QGraphicsView):
         if self._rubber is not None:
             self.scene_.removeItem(self._rubber)
             self._rubber = None
+        if self._draw_preview is not None:
+            self.scene_.removeItem(self._draw_preview)
+            self._draw_preview = None
         mode = self.mode
+        pen_points = self._pen_points
+        self._pen_points = []
         self._start_scene = self._start_page = self._start_pdf = None
 
         if mode == "add-text":
@@ -4218,6 +4729,18 @@ class PDFView(QGraphicsView):
             self.window_.do_strikeout(page, rx0, ry0, rx1, ry1)
         elif mode == "sticky":
             self.window_.do_sticky(page, sx, sy)
+        elif mode == "draw-pen":
+            if not pen_points or pen_points[-1] != (ex, ey):
+                pen_points.append((ex, ey))
+            self.window_.do_draw_pen(page, pen_points)
+        elif mode == "draw-rect":
+            self.window_.do_draw_rect(page, rx0, ry0, rx1, ry1)
+        elif mode == "draw-ellipse":
+            self.window_.do_draw_ellipse(page, rx0, ry0, rx1, ry1)
+        elif mode == "draw-line":
+            self.window_.do_draw_line(page, sx, sy, ex, ey)
+        elif mode == "draw-arrow":
+            self.window_.do_draw_arrow(page, sx, sy, ex, ey)
         elif mode == "form-text":
             self.window_.do_form_text(page, rx0, ry0, rx1, ry1)
         elif mode == "form-multiline":
@@ -4257,6 +4780,22 @@ class PDFView(QGraphicsView):
         if not self.doc or self._space_pan:
             return super().contextMenuEvent(ev)
         sp = self.mapToScene(ev.pos())
+        # Right-click on a drawing overlay → properties menu.
+        item = self.scene_.itemAt(sp, self.transform())
+        owner = item
+        while owner is not None and not isinstance(owner, (PenStrokeOverlay, ShapeOverlay)):
+            owner = owner.parentItem()
+        if isinstance(owner, (PenStrokeOverlay, ShapeOverlay)):
+            menu = QMenu(self)
+            props_act = menu.addAction("Properties…")
+            del_act = menu.addAction("Delete")
+            chosen = menu.exec(ev.globalPos())
+            if chosen is props_act:
+                self.window_.edit_drawing_properties(owner)
+            elif chosen is del_act:
+                self.window_.delete_drawing_overlay(owner)
+            ev.accept()
+            return
         loc = self._locate(sp)
         if loc is None:
             return super().contextMenuEvent(ev)
@@ -6417,6 +6956,10 @@ class MainWindow(QMainWindow):
                 ov = SignatureItem.deserialize(self.view, d)
             elif kind == "image":
                 ov = ImageOverlayItem.deserialize(self.view, d)
+            elif kind == "pen":
+                ov = PenStrokeOverlay.deserialize(self.view, d)
+            elif kind == "shape":
+                ov = ShapeOverlay.deserialize(self.view, d)
             else:
                 continue
             self.view.overlays.append(ov)
@@ -6539,6 +7082,11 @@ class MainWindow(QMainWindow):
             "form-signature": "Drag to add a signature field where the recipient will sign.",
             "form-date": "Drag to add a date field with a YYYY-MM-DD format hint.",
             "form-button": "Drag to add a push button (link to an action or script). (B)",
+            "draw-pen": "Freehand pen — click and drag to scribble. (P)",
+            "draw-rect": "Drag a rectangle to draw it on the page. (G)",
+            "draw-ellipse": "Drag a bounding box to draw an ellipse. (O)",
+            "draw-line": "Drag from start to end to draw a line. (L)",
+            "draw-arrow": "Drag from start to end to draw an arrow. (W)",
         }
         # Single-key shortcuts. We gate them at the QShortcut level (see
         # _install_tool_shortcuts) so they don't fire while typing into a
@@ -6556,6 +7104,11 @@ class MainWindow(QMainWindow):
             "form-radio": "R",
             "form-combo": "D",
             "form-button": "B",
+            "draw-pen": "P",
+            "draw-rect": "G",
+            "draw-ellipse": "O",
+            "draw-line": "L",
+            "draw-arrow": "W",
         }
         self._form_actions: list[QAction] = []
         form_modes = {
@@ -6583,6 +7136,11 @@ class MainWindow(QMainWindow):
             ("Signature Field", "form-signature"),
             ("Date Field", "form-date"),
             ("Push Button", "form-button"),
+            ("Pen", "draw-pen"),
+            ("Rectangle", "draw-rect"),
+            ("Ellipse", "draw-ellipse"),
+            ("Line", "draw-line"),
+            ("Arrow", "draw-arrow"),
         ):
             act = make(label, None, checkable=True)
             act.setToolTip(tool_tooltips.get(mode, label))
@@ -8583,6 +9141,126 @@ class MainWindow(QMainWindow):
         item.setSelected(True)
         self._mark_dirty()
         self.statusBar().showMessage(f"Inserted {os.path.basename(path)}")
+
+    # --- Drawing tools (pen / rect / ellipse / line / arrow) ----------
+    # Sticky-in-session defaults; right-click → Properties... overrides per overlay.
+    @property
+    def _draw_stroke_width(self) -> float:
+        return getattr(self, "_session_draw_width", 2.0)
+
+    def _draw_stroke_color(self) -> QColor:
+        c = getattr(self, "_session_draw_stroke", None)
+        if c is None:
+            c = current_accent_color()
+        return c
+
+    def _draw_fill_color(self) -> QColor | None:
+        return getattr(self, "_session_draw_fill", None)
+
+    def _add_drawing_overlay(self, item) -> None:
+        self.view.overlays.append(item)
+        self.view.scene_.addItem(item)
+        self._activate_tool("select")
+        item.setSelected(True)
+        self._mark_dirty()
+
+    def do_draw_pen(self, page_idx: int, points: list[tuple[float, float]]) -> None:
+        if not points or len(points) < 2:
+            return
+        self._snapshot()
+        item = PenStrokeOverlay(
+            self.view, page_idx, points,
+            stroke_color=QColor(self._draw_stroke_color()),
+            stroke_width=self._draw_stroke_width,
+        )
+        self._add_drawing_overlay(item)
+        self.statusBar().showMessage("Pen stroke added")
+
+    def _do_draw_shape(self, shape: str, page_idx: int,
+                       x0: float, y0: float, x1: float, y1: float) -> None:
+        self._snapshot()
+        item = ShapeOverlay(
+            self.view, page_idx, shape,
+            x0, y0, max(1.0, x1 - x0), max(1.0, y1 - y0),
+            stroke_color=QColor(self._draw_stroke_color()),
+            fill_color=(QColor(self._draw_fill_color()) if self._draw_fill_color() else None),
+            stroke_width=self._draw_stroke_width,
+        )
+        self._add_drawing_overlay(item)
+
+    def do_draw_rect(self, page_idx: int, x0: float, y0: float, x1: float, y1: float) -> None:
+        if (x1 - x0) < 2 or (y1 - y0) < 2:
+            return
+        self._do_draw_shape("rect", page_idx, x0, y0, x1, y1)
+        self.statusBar().showMessage("Rectangle added")
+
+    def do_draw_ellipse(self, page_idx: int, x0: float, y0: float, x1: float, y1: float) -> None:
+        if (x1 - x0) < 2 or (y1 - y0) < 2:
+            return
+        self._do_draw_shape("ellipse", page_idx, x0, y0, x1, y1)
+        self.statusBar().showMessage("Ellipse added")
+
+    def do_draw_line(self, page_idx: int, x0: float, y0: float, x1: float, y1: float) -> None:
+        # Lines and arrows are stored as bbox where (pdf_x, pdf_y) is the
+        # raw start point and (pdf_x+pdf_w, pdf_y+pdf_h) is the end. We
+        # allow negative dx/dy to preserve direction (needed for arrowheads).
+        if abs(x1 - x0) < 2 and abs(y1 - y0) < 2:
+            return
+        self._snapshot()
+        item = ShapeOverlay(
+            self.view, page_idx, "line",
+            x0, y0, x1 - x0, y1 - y0,
+            stroke_color=QColor(self._draw_stroke_color()),
+            stroke_width=self._draw_stroke_width,
+        )
+        self._add_drawing_overlay(item)
+        self.statusBar().showMessage("Line added")
+
+    def do_draw_arrow(self, page_idx: int, x0: float, y0: float, x1: float, y1: float) -> None:
+        if abs(x1 - x0) < 2 and abs(y1 - y0) < 2:
+            return
+        self._snapshot()
+        item = ShapeOverlay(
+            self.view, page_idx, "arrow",
+            x0, y0, x1 - x0, y1 - y0,
+            stroke_color=QColor(self._draw_stroke_color()),
+            stroke_width=self._draw_stroke_width,
+        )
+        self._add_drawing_overlay(item)
+        self.statusBar().showMessage("Arrow added")
+
+    def edit_drawing_properties(self, overlay) -> None:
+        dlg = DrawingPropertiesDialog(self, overlay)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        vals = dlg.result_values()
+        self._snapshot()
+        overlay.stroke_color = QColor(vals["stroke_color"])
+        overlay.stroke_width = float(vals["stroke_width"])
+        if "fill_color" in vals and isinstance(overlay, ShapeOverlay):
+            overlay.fill_color = QColor(vals["fill_color"]) if vals["fill_color"] is not None else None
+        # Update session defaults so the next tool use picks the picked colors.
+        self._session_draw_stroke = QColor(overlay.stroke_color)
+        self._session_draw_width = overlay.stroke_width
+        if isinstance(overlay, ShapeOverlay) and overlay.shape in ("rect", "ellipse"):
+            self._session_draw_fill = (
+                QColor(overlay.fill_color) if overlay.fill_color is not None else None
+            )
+        overlay.refresh()
+        self._mark_dirty()
+
+    def delete_drawing_overlay(self, overlay) -> None:
+        self._snapshot()
+        try:
+            if overlay.scene() is self.view.scene_:
+                self.view.scene_.removeItem(overlay)
+        except Exception:
+            pass
+        try:
+            self.view.overlays.remove(overlay)
+        except ValueError:
+            pass
+        self._mark_dirty()
 
     def _post_create_field(self, page_idx: int, w: "fitz.Widget") -> None:
         """Common tail for do_form_*: render, mark dirty, refresh panel,
