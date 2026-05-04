@@ -3306,6 +3306,74 @@ def _link_radio_group(doc: "fitz.Document", group_name: str) -> int | None:
     return parent_xref
 
 
+def _radio_parent_xref(doc: "fitz.Document", widget_xref: int) -> int | None:
+    """Return the /Parent xref of a radio kid, or None if the kid has no /Parent."""
+    try:
+        kind, val = doc.xref_get_key(widget_xref, "Parent")
+    except Exception:
+        return None
+    if kind != "xref":
+        return None
+    m = re.match(r"\s*(\d+)\s+0\s+R", val or "")
+    if not m:
+        return None
+    return int(m.group(1))
+
+
+def _rename_radio_group(doc: "fitz.Document", widget_xref: int, new_name: str) -> bool:
+    """Rename a grouped radio's group by writing /T on the parent xref.
+
+    Kids in a `_link_radio_group`-built group share a parent that owns /T;
+    each kid's /T is null (inherited per PDF 1.7 §12.7.3). Writing the
+    kid's /T directly splits the group. Returns True if the parent was
+    rewritten, False if the widget has no /Parent (caller should fall
+    back to plain `widget.field_name = new_name`).
+    """
+    parent_xref = _radio_parent_xref(doc, widget_xref)
+    if parent_xref is None:
+        return False
+    doc.xref_set_key(parent_xref, "T", f"({new_name})")
+    return True
+
+
+def _cleanup_radio_parent_after_delete(
+    doc: "fitz.Document", deleted_xref: int, parent_xref: int
+) -> None:
+    """Drop `deleted_xref` from a radio parent's /Kids array. If the parent
+    is now empty, remove it from /AcroForm/Fields and zero out the object.
+
+    PyMuPDF's `page.delete_widget()` removes the kid annot but never touches
+    the parent's /Kids array, so without this we leave a dangling
+    `<X 0 R>` ref pointing at a freed xref slot — pikepdf flags those.
+    """
+    try:
+        _, kids_raw = doc.xref_get_key(parent_xref, "Kids")
+    except Exception:
+        return
+    kid_xrefs = [int(m) for m in re.findall(r"(\d+)\s+0\s+R", kids_raw or "")]
+    remaining = [x for x in kid_xrefs if x != deleted_xref]
+    if remaining:
+        refs = " ".join(f"{x} 0 R" for x in remaining)
+        doc.xref_set_key(parent_xref, "Kids", f"[ {refs} ]")
+        return
+    # Parent is now empty — strip from /AcroForm/Fields and free the object.
+    catalog = doc.pdf_catalog()
+    try:
+        _, af = doc.xref_get_key(catalog, "AcroForm")
+    except Exception:
+        af = ""
+    fields_match = re.search(r"/Fields\s*\[(.*?)\]", af or "", re.DOTALL)
+    if fields_match:
+        existing = [int(m) for m in re.findall(r"(\d+)\s+0\s+R", fields_match.group(1))]
+        kept = [x for x in existing if x != parent_xref]
+        refs = " ".join(f"{x} 0 R" for x in kept)
+        doc.xref_set_key(catalog, "AcroForm", f"<< /Fields [ {refs} ] >>")
+    try:
+        doc.update_object(parent_xref, "<<>>")
+    except Exception:
+        pass
+
+
 def _all_radio_group_names(doc: "fitz.Document") -> list[str]:
     """Return unique radio field names in document order."""
     if doc is None:
@@ -3467,13 +3535,22 @@ class FieldPropertiesDialog(QDialog):
         self.readonly_cb.setChecked(bool(flags & 1))  # PDF_FIELD_IS_READ_ONLY = 1<<0
         self.noexport_cb = QCheckBox("No-export")
         self.noexport_cb.setChecked(bool(flags & 4))  # PDF_FIELD_IS_NO_EXPORT = 1<<2
-        self.hidden_cb = QCheckBox("Hidden")
-        self.hidden_cb.setChecked(int(self.widget.field_display or 0) == _PDF_FIELD_DISPLAY_HIDDEN)
+        # /F (field_display) maps 0/1/2/3 to four user-visible states. Adobe
+        # exposes these by name; we follow the same labels so a round-tripped
+        # field doesn't silently lose its NoView/NoPrint setting.
+        self.display_combo = QComboBox()
+        self.display_combo.addItem("Visible", 0)
+        self.display_combo.addItem("Hidden", 1)
+        self.display_combo.addItem("Visible but doesn't print", 2)
+        self.display_combo.addItem("Hidden but printable", 3)
+        cur_display = int(self.widget.field_display or 0)
+        idx_for_display = {0: 0, 1: 1, 2: 2, 3: 3}.get(cur_display, 0)
+        self.display_combo.setCurrentIndex(idx_for_display)
 
         form.addRow("Flags:", self.required_cb)
         form.addRow("", self.readonly_cb)
         form.addRow("", self.noexport_cb)
-        form.addRow("", self.hidden_cb)
+        form.addRow("Form Field:", self.display_combo)
 
         self.tabs.addTab(page, "General")
 
@@ -3514,7 +3591,19 @@ class FieldPropertiesDialog(QDialog):
 
         self.align_combo = QComboBox()
         self.align_combo.addItems(self._ALIGN_LABELS)
-        self.align_combo.setCurrentIndex(int(getattr(self.widget, "_pe_text_align", 0)))
+        # /Q (0=Left, 1=Center, 2=Right) is persisted on the widget xref —
+        # `_pe_text_align` is a transient runtime attr that's missing on reopen.
+        align_idx = int(getattr(self.widget, "_pe_text_align", 0))
+        if self.doc is not None:
+            try:
+                qkind, qval = self.doc.xref_get_key(self.widget.xref, "Q")
+                if qkind == "int":
+                    persisted = int(str(qval).strip())
+                    if persisted in (0, 1, 2):
+                        align_idx = persisted
+            except Exception:
+                pass
+        self.align_combo.setCurrentIndex(align_idx)
         form.addRow("Text alignment:", self.align_combo)
 
         self.tabs.addTab(page, "Appearance")
@@ -3541,6 +3630,7 @@ class FieldPropertiesDialog(QDialog):
         self.allow_custom_cb = None
         self.calc_op_combo = None
         self.calc_sources_list = None
+        self.multiline_cb = None
 
         if ft == fitz.PDF_WIDGET_TYPE_TEXT:
             self.default_value_edit = QLineEdit(self.widget.field_value or "")
@@ -3551,6 +3641,12 @@ class FieldPropertiesDialog(QDialog):
             self.maxlen_spin.setValue(int(self.widget.text_maxlen or 0))
             self.maxlen_spin.setSpecialValueText("Unlimited")
             form.addRow("Max length:", self.maxlen_spin)
+
+            self.multiline_cb = QCheckBox("Multi-line")
+            self.multiline_cb.setChecked(
+                bool(int(self.widget.field_flags or 0) & fitz.PDF_TX_FIELD_IS_MULTILINE)
+            )
+            form.addRow("", self.multiline_cb)
 
             self.format_combo = QComboBox()
             self.format_combo.addItems(self._FORMAT_LABELS)
@@ -3628,6 +3724,14 @@ class FieldPropertiesDialog(QDialog):
 
             self.choices_default_combo = QComboBox()
             self._refresh_choices_default()
+            # _refresh_choices_default only restores `cur_text` from the combo;
+            # on first build the combo is empty, so the persisted field_value
+            # never seeds. Set it explicitly here.
+            persisted_default = self.widget.field_value or ""
+            if isinstance(persisted_default, str) and persisted_default:
+                idx = self.choices_default_combo.findText(persisted_default)
+                if idx >= 0:
+                    self.choices_default_combo.setCurrentIndex(idx)
             self.choices_list.model().rowsInserted.connect(
                 lambda *a: self._refresh_choices_default()
             )
@@ -3674,18 +3778,26 @@ class FieldPropertiesDialog(QDialog):
         form = QFormLayout()
         layout.addLayout(form)
 
-        def _editor(initial: str) -> QPlainTextEdit:
+        # Track per-editor user-edit dirty flags so Options-tab Format
+        # writes don't clobber JS the user typed manually in Actions.
+        # Programmatic setPlainText below fires textChanged, so we only
+        # mark the editor dirty when the signal fires AFTER setup.
+        self._action_dirty: dict[str, bool] = {}
+
+        def _editor(initial: str, key: str) -> QPlainTextEdit:
             ed = QPlainTextEdit()
             ed.setPlainText(initial or "")
             ed.setMinimumHeight(60)
+            self._action_dirty[key] = False
+            ed.textChanged.connect(lambda k=key: self._action_dirty.__setitem__(k, True))
             return ed
 
-        self.action_focus_edit = _editor(self.widget.script_focus or "")
-        self.action_blur_edit = _editor(self.widget.script_blur or "")
-        self.action_mouseup_edit = _editor(self.widget.script or "")
-        self.action_calc_edit = _editor(self.widget.script_calc or "")
-        self.action_format_edit = _editor(self.widget.script_format or "")
-        self.action_keystroke_edit = _editor(self.widget.script_change or "")
+        self.action_focus_edit = _editor(self.widget.script_focus or "", "focus")
+        self.action_blur_edit = _editor(self.widget.script_blur or "", "blur")
+        self.action_mouseup_edit = _editor(self.widget.script or "", "mouseup")
+        self.action_calc_edit = _editor(self.widget.script_calc or "", "calc")
+        self.action_format_edit = _editor(self.widget.script_format or "", "format")
+        self.action_keystroke_edit = _editor(self.widget.script_change or "", "keystroke")
 
         form.addRow("On Focus:", self.action_focus_edit)
         form.addRow("On Blur:", self.action_blur_edit)
@@ -3764,11 +3876,12 @@ class FieldPropertiesDialog(QDialog):
         if ft == fitz.PDF_WIDGET_TYPE_COMBOBOX and self.allow_custom_cb is not None:
             edit_bit = fitz.PDF_CH_FIELD_IS_EDIT
             flags = (flags | edit_bit) if self.allow_custom_cb.isChecked() else (flags & ~edit_bit)
+        if ft == fitz.PDF_WIDGET_TYPE_TEXT and self.multiline_cb is not None:
+            ml = fitz.PDF_TX_FIELD_IS_MULTILINE
+            flags = (flags | ml) if self.multiline_cb.isChecked() else (flags & ~ml)
         w.field_flags = flags
 
-        w.field_display = (
-            _PDF_FIELD_DISPLAY_HIDDEN if self.hidden_cb.isChecked() else 0
-        )
+        w.field_display = int(self.display_combo.currentData() or 0)
 
         # Actions tab — written first so Options-tab Format/Calc can overwrite
         # the matching slots when the user picks a non-"None" option there.
@@ -3804,14 +3917,24 @@ class FieldPropertiesDialog(QDialog):
             if self.format_combo is not None:
                 fmt = self.format_combo.currentText()
                 w._pe_format = fmt
+                # If the user typed JS into the Actions-tab On Format /
+                # On Keystroke editors, preserve their text — don't let
+                # the Options-tab Format dropdown silently overwrite it.
+                fmt_dirty = self._action_dirty.get("format", False)
+                ks_dirty = self._action_dirty.get("keystroke", False)
                 if fmt in _FORMAT_SCRIPTS:
                     fs, ks = _FORMAT_SCRIPTS[fmt]
-                    w.script_format = fs
-                    w.script_change = ks
+                    if not fmt_dirty:
+                        w.script_format = fs
+                    if not ks_dirty:
+                        w.script_change = ks
                 else:
-                    # User picked "None" → strip any prior format script.
-                    w.script_format = ""
-                    w.script_change = ""
+                    # User picked "None" → strip any prior format script
+                    # (still respect explicit user edits in Actions).
+                    if not fmt_dirty:
+                        w.script_format = ""
+                    if not ks_dirty:
+                        w.script_change = ""
             if self.calc_op_combo is not None and self.calc_sources_list is not None:
                 op = self.calc_op_combo.currentText()
                 srcs = [
@@ -3961,7 +4084,6 @@ class FormBuilderPanel(QDockWidget):
         self.setWidget(body)
 
         self._suspend_changes = False
-        self._dropped = False
         self.tree.installEventFilter(self)
         self.refresh()
 
@@ -4094,41 +4216,69 @@ class FormBuilderPanel(QDockWidget):
             return False
         pi = item.data(0, self.PAGE_ROLE)
         xr = item.data(0, self.XREF_ROLE)
-        if pi is None or xr is None or not self.window_.view.doc:
+        doc = self.window_.view.doc
+        if pi is None or xr is None or not doc:
             return False
         self.window_._snapshot()
+        relink_group: str | None = None
         try:
-            with _bound_widget(self.window_.view.doc, pi, xr) as (_page, w):
+            with _bound_widget(doc, pi, xr) as (_page, w):
                 if w.field_name == new_name:
                     if self.window_._undo:
                         self.window_._undo.pop()
                     return True
-                w.field_name = new_name
-                w.update()
+                # Grouped radios: /T lives on the parent, kids inherit.
+                # Writing w.field_name directly splits the group.
+                is_radio = w.field_type == fitz.PDF_WIDGET_TYPE_RADIOBUTTON
+                if is_radio and _rename_radio_group(doc, xr, new_name):
+                    relink_group = new_name
+                else:
+                    w.field_name = new_name
+                    w.update()
         except Exception:
             if self.window_._undo:
                 self.window_._undo.pop()
             return False
+        if relink_group:
+            try:
+                _link_radio_group(doc, relink_group)
+            except Exception as exc:
+                print(f"[radio] relink after rename failed: {exc}", file=sys.stderr)
         self.window_.view.render_all(preserve_scroll=True)
         self.window_._mark_dirty()
         self.window_._refresh_form_panel()
         return True
 
     def apply_reorder(self, ordered_xrefs: list[tuple[int, int]]) -> None:
-        """Persist a new tab order, mirroring TabOrderDialog.apply_to_doc()."""
+        """Persist a new tab order, mirroring TabOrderDialog.apply_to_doc().
+
+        Cross-page moves: a widget's xref dict is shared, but each page's
+        /Annots holds a reference. To move xref X from page A to page B we
+        must rewrite BOTH pages — A drops X, B gains X. We compute the
+        before-snapshot of (page → set-of-widget-xrefs), then rewrite every
+        page that either previously held a moved xref or now holds one.
+        Without this, dragging the only widget on page A to page B leaves
+        a stale /Annots entry on A AND adds it to B → duplicated widget.
+        """
         doc = self.window_.view.doc
         if doc is None:
             return
+        before_by_page: dict[int, set[int]] = {}
+        for pi, w in self.window_.collect_all_widgets():
+            before_by_page.setdefault(pi, set()).add(w.xref)
         per_page: dict[int, list[int]] = {}
         for pi, xr in ordered_xrefs:
             per_page.setdefault(pi, []).append(xr)
+        affected_pages: set[int] = set(before_by_page.keys()) | set(per_page.keys())
         self.window_._snapshot()
         try:
-            for pi, widget_xrefs in per_page.items():
+            for pi in affected_pages:
                 if pi < 0 or pi >= len(doc):
                     continue
                 page = doc[pi]
-                current_widget_xrefs = {w.xref for w in page.widgets()}
+                widget_xrefs = per_page.get(pi, [])
+                page_widget_xrefs_now = {w.xref for w in page.widgets()}
+                stale_widget_xrefs = before_by_page.get(pi, set()) | page_widget_xrefs_now
                 try:
                     _, raw = doc.xref_get_key(page.xref, "Annots")
                 except Exception:
@@ -4137,7 +4287,7 @@ class FormBuilderPanel(QDockWidget):
                 for m in re.findall(r"(\d+)\s+0\s+R", raw or ""):
                     existing_order.append(int(m))
                 non_widget_tail = [
-                    x for x in existing_order if x not in current_widget_xrefs
+                    x for x in existing_order if x not in stale_widget_xrefs
                 ]
                 new_order = list(widget_xrefs) + non_widget_tail
                 arr = "[ " + " ".join(f"{x} 0 R" for x in new_order) + " ]"
@@ -4178,14 +4328,17 @@ class FormBuilderPanel(QDockWidget):
         if item.data(0, self.KIND_ROLE) != "field":
             return
         new_text = item.text(0).strip()
-        # Strip the icon prefix the user may not have removed.
-        prefix_chars = {label[0] for label in _FIELD_TYPE_LABELS.values()}
-        prefix_chars.add("\u00b6")
+        # Strip ONLY this widget's own icon-prefix (e.g. "T  Foo" \u2192 "Foo").
+        # Stripping any icon char from the global set ate the leading "T"
+        # of legitimate names like "Total" or "Title".
         cleaned = new_text
-        for prefix in list(prefix_chars):
+        sel = self._resolve_widget(item)
+        if sel is not None:
+            _, w_for_icon = sel
+            own_icon, _ = _field_type_display(w_for_icon)
+            prefix = f"{own_icon} "
             if cleaned.startswith(prefix):
                 cleaned = cleaned[len(prefix):].lstrip()
-                break
         prev = item.data(0, Qt.ItemDataRole.UserRole) or ""
         if not cleaned or cleaned == prev:
             self._suspend_changes = True
@@ -6041,14 +6194,22 @@ class MainWindow(QMainWindow):
         except Exception:
             return
         self._snapshot()
+        parent_xref: int | None = None
         try:
             with _bound_widget(self.view.doc, page_idx, xref) as (page, w):
+                if w.field_type == fitz.PDF_WIDGET_TYPE_RADIOBUTTON:
+                    parent_xref = _radio_parent_xref(self.view.doc, xref)
                 page.delete_widget(w)
         except Exception as exc:
             QMessageBox.warning(self, "Delete field", f"Could not delete: {exc}")
             if self._undo:
                 self._undo.pop()
             return
+        if parent_xref is not None:
+            try:
+                _cleanup_radio_parent_after_delete(self.view.doc, xref, parent_xref)
+            except Exception as exc:
+                print(f"[radio] parent cleanup after delete failed: {exc}", file=sys.stderr)
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
         self._refresh_form_panel()
@@ -6209,8 +6370,6 @@ class MainWindow(QMainWindow):
         if panel is None:
             return
         QTimer.singleShot(0, panel.refresh)
-        # Also refresh synchronously so tests that don't spin the event loop see the new state.
-        panel.refresh()
         # Auto-show on first widget if user hasn't explicitly hidden it.
         if self._form_panel_user_choice is None and self.view.doc:
             has_any = any(True for _ in self.collect_all_widgets())
@@ -6294,6 +6453,7 @@ class MainWindow(QMainWindow):
         page.set_rotation((page.rotation + 90) % 360)
         self.view.render_all(preserve_scroll=True)
         self._mark_dirty()
+        self._refresh_form_panel()
         msg = f"Rotated page {idx + 1}"
         if baked:
             msg += f" (flattened {baked} item{'s' if baked != 1 else ''})"
@@ -6314,6 +6474,7 @@ class MainWindow(QMainWindow):
         self.view.scroll_to_page(idx + 1)
         self._refresh_page_label()
         self._mark_dirty()
+        self._refresh_form_panel()
         self.statusBar().showMessage(f"Inserted blank page after page {idx + 1}")
 
     def delete_current_page(self):
@@ -6349,6 +6510,7 @@ class MainWindow(QMainWindow):
         self.view.scroll_to_page(new_idx)
         self._refresh_page_label()
         self._mark_dirty()
+        self._refresh_form_panel()
         self.statusBar().showMessage(f"Deleted page {idx + 1}")
 
     # --- Find ---

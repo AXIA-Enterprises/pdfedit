@@ -111,6 +111,7 @@ def test_panel_delete_selected_removes_field(main_window, tmp_path):
     panel.tree.setCurrentItem(target)
 
     assert panel.delete_selected()
+    panel.refresh()
     rows = _field_items(panel)
     assert [r[1] for r in rows] == ["to_keep"]
 
