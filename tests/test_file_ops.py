@@ -8,6 +8,7 @@ extract-with-overlays, full-bake-failure refusal, and the visible
 from __future__ import annotations
 
 import os
+import sys
 
 import fitz
 import pytest
@@ -96,8 +97,13 @@ def test_open_password_protected_pdf_with_wrong_password_refuses(
 
 
 # ---------------------------------------------------------------------------
-# 2. Recent-file dedup is case-insensitive
+# 2. Recent-file dedup is case-insensitive (darwin/Windows only — case-
+#    sensitive filesystems on Linux legitimately keep both entries)
 # ---------------------------------------------------------------------------
+@pytest.mark.skipif(
+    sys.platform not in ("darwin", "win32"),
+    reason="recent-file dedup is only case-insensitive on case-insensitive filesystems",
+)
 def test_add_recent_dedups_case_insensitive(
     main_window, tmp_path, isolated_settings
 ):
