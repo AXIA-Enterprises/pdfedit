@@ -2000,6 +2000,382 @@ class SplitPdfDialog(QDialog):
             self.set_output_folder(chosen)
 
 
+# ---------------------------------------------------------------------------
+# Compress PDF — quality presets + image recompression utilities
+# ---------------------------------------------------------------------------
+
+# (jpeg_quality, target_dpi or None for "no downsampling")
+COMPRESS_PRESETS: dict[str, tuple[int, int | None]] = {
+    "low":    (40, 72),
+    "medium": (65, 150),
+    "high":   (85, None),
+}
+
+# Skip images smaller than this many pixels on either side; tiny icons gain
+# little from re-encoding and a JPEG round-trip would actively bloat them.
+_COMPRESS_MIN_DIM = 64
+
+
+def _compress_recompress_jpeg(pix: "fitz.Pixmap", quality: int) -> bytes:
+    """Encode a Pixmap as JPEG bytes via PyMuPDF native encoder.
+
+    PyMuPDF 1.24+ ships `Pixmap.tobytes("jpeg", jpg_quality=...)`. We rely on
+    that; older builds raise and the caller can fall through to PIL.
+    """
+    return pix.tobytes("jpeg", jpg_quality=int(quality))
+
+
+def _compress_downsample_pix(
+    pix: "fitz.Pixmap", target_dpi: int, current_dpi: float
+) -> "fitz.Pixmap":
+    """Return a new Pixmap downsampled to roughly target_dpi.
+
+    Uses Pixmap.shrink(factor) which divides w/h by 2**factor; we pick the
+    largest factor that still leaves us at >= target_dpi. For arbitrary
+    ratios we fall through to PIL when the factor would be 0.
+    """
+    if target_dpi <= 0 or current_dpi <= target_dpi:
+        return pix
+    ratio = current_dpi / target_dpi
+    factor = 0
+    while (2 ** (factor + 1)) <= ratio:
+        factor += 1
+    if factor == 0:
+        return pix
+    new_pix = fitz.Pixmap(pix)  # copy so we don't mutate the source
+    new_pix.shrink(factor)
+    return new_pix
+
+
+def _compress_image_dpi(page: "fitz.Page", img_info) -> float:
+    """Estimate the on-page DPI of an embedded image.
+
+    img_info is a tuple from page.get_images(full=True). We use the image's
+    pixel width and the placement rect width on the page (in points → inches).
+    Returns 0.0 if the image isn't placed (orphan) or bbox lookup fails.
+    """
+    try:
+        bbox = page.get_image_bbox(img_info)
+    except Exception:
+        return 0.0
+    if bbox is None or bbox.width <= 0:
+        return 0.0
+    pixel_w = int(img_info[2])
+    inches = bbox.width / 72.0
+    if inches <= 0:
+        return 0.0
+    return pixel_w / inches
+
+
+def _compress_estimate_image_bytes(
+    doc: "fitz.Document", quality: int, target_dpi: int | None
+) -> tuple[int, int]:
+    """Walk the document, return (current_image_bytes, projected_image_bytes).
+
+    Approximate: for each placed image we read the existing stream length
+    and simulate a recompressed pixmap → JPEG at the chosen settings. Skips
+    tiny images (< _COMPRESS_MIN_DIM on either side).
+    """
+    seen: set[int] = set()
+    current = 0
+    projected = 0
+    for page in doc:
+        try:
+            imgs = page.get_images(full=True)
+        except Exception:
+            continue
+        for img_info in imgs:
+            xref = int(img_info[0])
+            if xref in seen:
+                continue
+            seen.add(xref)
+            try:
+                stream = doc.xref_stream_raw(xref)
+                cur_len = len(stream) if stream else 0
+            except Exception:
+                cur_len = 0
+            current += cur_len
+            w = int(img_info[2])
+            h = int(img_info[3])
+            if w < _COMPRESS_MIN_DIM or h < _COMPRESS_MIN_DIM:
+                projected += cur_len
+                continue
+            try:
+                pix = fitz.Pixmap(doc, xref)
+            except Exception:
+                projected += cur_len
+                continue
+            try:
+                if pix.alpha or pix.colorspace is None or \
+                        pix.colorspace.name not in ("DeviceRGB", "DeviceGray"):
+                    pix = fitz.Pixmap(fitz.csRGB, pix)
+                if target_dpi is not None:
+                    dpi = _compress_image_dpi(page, img_info)
+                    if dpi > target_dpi:
+                        pix = _compress_downsample_pix(pix, target_dpi, dpi)
+                jpg = _compress_recompress_jpeg(pix, quality)
+                projected += len(jpg)
+            except Exception:
+                projected += cur_len
+            finally:
+                pix = None
+    return current, projected
+
+
+def _compress_apply_to_doc(
+    doc: "fitz.Document",
+    quality: int,
+    target_dpi: int | None,
+    *,
+    progress_cb=None,
+    cancel_cb=None,
+) -> bool:
+    """Recompress every placed image in `doc` in-place. Returns False if cancelled.
+
+    progress_cb(page_idx, page_count) called once per page (after that page
+    is processed). cancel_cb() returning truthy aborts the walk.
+    """
+    seen: set[int] = set()
+    page_count = len(doc)
+    for page_idx, page in enumerate(doc):
+        if cancel_cb and cancel_cb():
+            return False
+        try:
+            imgs = page.get_images(full=True)
+        except Exception:
+            imgs = []
+        for img_info in imgs:
+            xref = int(img_info[0])
+            if xref in seen:
+                continue
+            seen.add(xref)
+            w = int(img_info[2])
+            h = int(img_info[3])
+            if w < _COMPRESS_MIN_DIM or h < _COMPRESS_MIN_DIM:
+                continue
+            try:
+                pix = fitz.Pixmap(doc, xref)
+                if pix.alpha or pix.colorspace is None or \
+                        pix.colorspace.name not in ("DeviceRGB", "DeviceGray"):
+                    pix = fitz.Pixmap(fitz.csRGB, pix)
+                if target_dpi is not None:
+                    dpi = _compress_image_dpi(page, img_info)
+                    if dpi > target_dpi:
+                        pix = _compress_downsample_pix(pix, target_dpi, dpi)
+                jpg = _compress_recompress_jpeg(pix, quality)
+                # Only keep the rewrite if it's actually smaller — otherwise
+                # JPEGing a small icon can bloat the file.
+                try:
+                    cur_stream = doc.xref_stream_raw(xref)
+                    cur_len = len(cur_stream) if cur_stream else 0
+                except Exception:
+                    cur_len = 0
+                if cur_len and len(jpg) >= cur_len:
+                    continue
+                doc.update_stream(xref, jpg, new=True)
+                cs_name = "/DeviceGray" if pix.n == 1 else "/DeviceRGB"
+                doc.xref_set_key(xref, "Filter", "/DCTDecode")
+                doc.xref_set_key(xref, "ColorSpace", cs_name)
+                doc.xref_set_key(xref, "BitsPerComponent", "8")
+                doc.xref_set_key(xref, "Width", str(pix.width))
+                doc.xref_set_key(xref, "Height", str(pix.height))
+                try:
+                    doc.xref_set_key(xref, "DecodeParms", "null")
+                except Exception:
+                    pass
+                try:
+                    doc.xref_set_key(xref, "SMask", "null")
+                except Exception:
+                    pass
+            except Exception as exc:
+                print(f"[compress] xref {xref}: {exc}", file=sys.stderr)
+        if progress_cb:
+            progress_cb(page_idx + 1, page_count)
+    return True
+
+
+class CompressDialog(QDialog):
+    """Configure recompression of the open PDF."""
+
+    PRESET_LABELS = [("Low (smallest file)", "low"),
+                     ("Medium (recommended)", "medium"),
+                     ("High (best quality)", "high")]
+
+    OUTPUT_NEW = "new"
+    OUTPUT_REPLACE = "replace"
+
+    def __init__(self, parent=None, *, source_path: str | None = None,
+                 doc: "fitz.Document | None" = None):
+        super().__init__(parent)
+        self.setWindowTitle("Compress PDF")
+        self.setMinimumWidth(460)
+
+        self._source_path = source_path
+        self._doc = doc
+        self._original_size = self._compute_original_size()
+
+        if source_path:
+            stem, ext = os.path.splitext(source_path)
+            self._default_output = f"{stem}_compressed{ext or '.pdf'}"
+        else:
+            self._default_output = ""
+        self._output_path = self._default_output
+
+        self.preset_combo = QComboBox()
+        for label, _key in self.PRESET_LABELS:
+            self.preset_combo.addItem(label)
+        self.preset_combo.setCurrentIndex(1)  # medium default
+        self.preset_combo.currentIndexChanged.connect(self._refresh_estimate)
+
+        self.rb_new = QRadioButton("Save as new file")
+        self.rb_replace = QRadioButton("Replace original")
+        self.rb_new.setChecked(True)
+        self._out_group = QButtonGroup(self)
+        self._out_group.addButton(self.rb_new, 0)
+        self._out_group.addButton(self.rb_replace, 1)
+        self.rb_new.toggled.connect(self._on_output_toggled)
+        self.rb_replace.toggled.connect(self._on_output_toggled)
+
+        self.path_label = QLabel(self._output_path or "(no source path)")
+        self.path_label.setWordWrap(True)
+        self.choose_btn = QPushButton("Choose…")
+        self.choose_btn.clicked.connect(self._choose_path)
+
+        self.estimate_label = QLabel("Estimated size: —")
+        self.estimate_label.setWordWrap(True)
+        self.estimate_label.setStyleSheet("color: #444;")
+
+        self.bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.bb.button(QDialogButtonBox.StandardButton.Ok).setText("Compress")
+        self.bb.accepted.connect(self.accept)
+        self.bb.rejected.connect(self.reject)
+
+        form = QFormLayout()
+        form.addRow("Quality:", self.preset_combo)
+
+        out_box = QGroupBox("Output")
+        out_layout = QVBoxLayout(out_box)
+        out_layout.addWidget(self.rb_new)
+        path_row = QHBoxLayout()
+        path_row.addSpacing(20)
+        path_row.addWidget(self.choose_btn)
+        path_row.addWidget(self.path_label, 1)
+        out_layout.addLayout(path_row)
+        out_layout.addWidget(self.rb_replace)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(out_box)
+        layout.addWidget(self.estimate_label)
+        layout.addWidget(self.bb)
+
+        self._refresh_estimate()
+
+    # ----- presets ------------------------------------------------------
+    def preset_key(self) -> str:
+        return self.PRESET_LABELS[self.preset_combo.currentIndex()][1]
+
+    def set_preset(self, key: str) -> None:
+        for i, (_label, k) in enumerate(self.PRESET_LABELS):
+            if k == key:
+                self.preset_combo.setCurrentIndex(i)
+                return
+        raise ValueError(f"unknown preset: {key!r}")
+
+    def preset_settings(self) -> tuple[int, int | None]:
+        return COMPRESS_PRESETS[self.preset_key()]
+
+    # ----- output ------------------------------------------------------
+    def output_mode(self) -> str:
+        return self.OUTPUT_REPLACE if self.rb_replace.isChecked() else self.OUTPUT_NEW
+
+    def set_output_mode(self, mode: str) -> None:
+        if mode == self.OUTPUT_REPLACE:
+            self.rb_replace.setChecked(True)
+        else:
+            self.rb_new.setChecked(True)
+
+    def output_path(self) -> str:
+        if self.output_mode() == self.OUTPUT_REPLACE:
+            return self._source_path or ""
+        return self._output_path
+
+    def set_output_path(self, path: str) -> None:
+        self._output_path = path
+        self.path_label.setText(path)
+
+    def _on_output_toggled(self, _checked: bool) -> None:
+        replacing = self.rb_replace.isChecked()
+        self.choose_btn.setEnabled(not replacing)
+        self.path_label.setEnabled(not replacing)
+        if replacing:
+            self.path_label.setText(self._source_path or "(no source path)")
+        else:
+            self.path_label.setText(self._output_path or "(no source path)")
+
+    def _choose_path(self) -> None:
+        start = self._output_path or self._default_output or ""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Compressed PDF As", start, "PDF Files (*.pdf)"
+        )
+        if path:
+            if not path.lower().endswith(".pdf"):
+                path += ".pdf"
+            self.set_output_path(path)
+
+    # ----- estimate ----------------------------------------------------
+    def _compute_original_size(self) -> int:
+        if self._source_path and os.path.exists(self._source_path):
+            try:
+                return os.path.getsize(self._source_path)
+            except OSError:
+                pass
+        if self._doc is not None:
+            try:
+                return len(self._doc.tobytes())
+            except Exception:
+                return 0
+        return 0
+
+    def _refresh_estimate(self) -> None:
+        quality, target_dpi = self.preset_settings()
+        if self._doc is None:
+            self.estimate_label.setText("Estimated size: —")
+            return
+        try:
+            cur_imgs, proj_imgs = _compress_estimate_image_bytes(
+                self._doc, quality, target_dpi
+            )
+        except Exception:
+            cur_imgs, proj_imgs = 0, 0
+        orig = self._original_size or cur_imgs
+        # Estimate end-size: original − (savings on image streams).
+        savings = max(0, cur_imgs - proj_imgs)
+        projected = max(1, orig - savings)
+        if orig <= 0:
+            self.estimate_label.setText("Estimated size: —")
+            return
+        pct = int(round(100 * (orig - projected) / orig)) if orig else 0
+        self.estimate_label.setText(
+            f"Estimated size: {_compress_fmt_bytes(orig)} → "
+            f"{_compress_fmt_bytes(projected)} ({pct}% smaller)"
+        )
+
+    def estimate_text(self) -> str:
+        return self.estimate_label.text()
+
+
+def _compress_fmt_bytes(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / (1024 * 1024):.2f} MB"
+
+
 CURSIVE_FONTS = ["Dancing Script", "Pacifico", "Caveat", "Permanent Marker",
                  "Lobster", "Shadows Into Light"]
 
@@ -5693,6 +6069,7 @@ class MainWindow(QMainWindow):
         self.act_merge = make("Merge PDF…", self.merge_pdfs)
         self.act_extract = make("Extract Pages…", self.extract_pages_dialog)
         self.act_split = make("Split…", self.open_split_dialog)
+        self.act_compress = make("Compress…", self.open_compress_dialog)
         self.act_preferences = make("Preferences…", self.open_settings_dialog, "Ctrl+,")
         self.act_preferences.setMenuRole(QAction.MenuRole.PreferencesRole)
 
@@ -5967,7 +6344,8 @@ class MainWindow(QMainWindow):
         menu_spec: list[tuple[str, list]] = [
             ("&File", [self.act_new, self.act_open, self.recent_menu, None,
                        self.act_save, self.act_save_as, None,
-                       self.act_merge, self.act_extract, self.act_split, None,
+                       self.act_merge, self.act_extract, self.act_split,
+                       self.act_compress, None,
                        self.act_preferences]),
             ("&Edit", [self.act_undo, self.act_redo, None,
                        self.act_find, self.act_find_next, self.act_find_prev,
@@ -7226,6 +7604,163 @@ class MainWindow(QMainWindow):
                 progress.setValue(idx + 1)
                 QApplication.processEvents()
         return written, errors, cancelled
+
+    # ---------------- Compress ----------------
+    def open_compress_dialog(self):
+        if not self.view.doc:
+            QMessageBox.information(
+                self, "Compress PDF", "Open or create a PDF first to compress."
+            )
+            return
+        dlg = CompressDialog(
+            self, source_path=self.path, doc=self.view.doc,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._run_compress(dlg)
+
+    def _run_compress(self, dlg: "CompressDialog") -> None:
+        out_path = dlg.output_path()
+        if not out_path:
+            QMessageBox.warning(
+                self, "Compress PDF",
+                "No output path. Save the PDF first or pick an output file.",
+            )
+            return
+        replacing = dlg.output_mode() == dlg.OUTPUT_REPLACE
+        if replacing:
+            confirm = QMessageBox.question(
+                self, "Compress PDF",
+                "This will overwrite the original file. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+
+        quality, target_dpi = dlg.preset_settings()
+        original_size = 0
+        if self.path and os.path.exists(self.path):
+            try:
+                original_size = os.path.getsize(self.path)
+            except OSError:
+                original_size = 0
+
+        page_count = len(self.view.doc)
+        progress = QProgressDialog(
+            "Compressing PDF…", "Cancel", 0, max(1, page_count), self
+        )
+        progress.setWindowTitle("Compress PDF")
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        QApplication.processEvents()
+
+        clone, failed = self._bake_to_clone()
+        cancelled_flag = {"v": False}
+
+        def _cancel_cb():
+            QApplication.processEvents()
+            return progress.wasCanceled()
+
+        def _progress_cb(done: int, total: int):
+            progress.setMaximum(max(1, total))
+            progress.setValue(done)
+            QApplication.processEvents()
+
+        tmp_path = out_path + ".tmp"
+        try:
+            ok = _compress_apply_to_doc(
+                clone, quality, target_dpi,
+                progress_cb=_progress_cb, cancel_cb=_cancel_cb,
+            )
+            if not ok:
+                cancelled_flag["v"] = True
+            else:
+                try:
+                    clone.save(
+                        tmp_path,
+                        garbage=4,
+                        deflate=True,
+                        deflate_images=True,
+                        deflate_fonts=True,
+                        clean=True,
+                    )
+                except TypeError:
+                    clone.save(tmp_path, garbage=4, deflate=True, clean=True)
+        except Exception as exc:
+            try:
+                clone.close()
+            except Exception:
+                pass
+            progress.close()
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except Exception:
+                pass
+            QMessageBox.critical(self, "Compress PDF", f"Compression failed:\n{exc}")
+            return
+        finally:
+            try:
+                clone.close()
+            except Exception:
+                pass
+            progress.close()
+
+        if failed:
+            self._report_bake_failures(failed)
+
+        if cancelled_flag["v"]:
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except Exception:
+                pass
+            QMessageBox.information(
+                self, "Compress PDF",
+                "Compression cancelled. No file was written.",
+            )
+            return
+
+        try:
+            os.replace(tmp_path, out_path)
+        except Exception as exc:
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except Exception:
+                pass
+            QMessageBox.critical(
+                self, "Compress PDF", f"Could not write output:\n{exc}"
+            )
+            return
+
+        try:
+            new_size = os.path.getsize(out_path)
+        except OSError:
+            new_size = 0
+        if original_size <= 0:
+            original_size = new_size
+        delta_pct = 0
+        if original_size > 0:
+            delta_pct = int(round(100 * (original_size - new_size) / original_size))
+        src_name = os.path.basename(self.path) if self.path else "(unsaved)"
+        out_name = os.path.basename(out_path)
+        QMessageBox.information(
+            self, "Compress PDF",
+            f"Compressed {src_name} from "
+            f"{_compress_fmt_bytes(original_size)} to "
+            f"{_compress_fmt_bytes(new_size)} ({delta_pct}% smaller).\n\n"
+            f"Output: {out_name}",
+        )
+        self.statusBar().showMessage(
+            f"Compressed: {src_name} → {out_name} "
+            f"({_compress_fmt_bytes(new_size)}, {delta_pct}% smaller)"
+        )
+
+        if replacing:
+            # Reload the freshly-written file so the editor reflects the
+            # compressed streams (matches Save behavior).
+            self.open_path(out_path)
 
     def do_erase(self, page_idx: int, x0, y0, x1, y1):
         if x1 - x0 < 2 or y1 - y0 < 2:
